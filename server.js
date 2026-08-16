@@ -32,7 +32,6 @@ async function sendTelegramReply(chatId, text) {
 // WhatsApp Webhook endpoint
 app.post('/webhook', async (req, res) => {
     const payload = req.body;
-    res.status(200).send('Webhook processed');
 
     try {
         const message = payload?.data?.body;
@@ -41,20 +40,24 @@ app.post('/webhook', async (req, res) => {
         if (message && msgType === 'text') {
             await processExpenseMessage(message);
         }
+        // ONLY send 200 AFTER processing is complete to keep Vercel alive
+        res.status(200).send('Webhook processed');
     } catch (error) {
-        // do not block WA flow
+        console.error("❌ Error processing WA webhook logic:", error);
+        res.status(500).send('Internal Error');
     }
 });
 
 // Telegram Webhook endpoint
 app.post('/telegram/webhook', async (req, res) => {
     const payload = req.body;
-    res.status(200).send('Telegram webhook processed');
 
     try {
         // Safe access Telegram message payload
         const msgObj = payload?.message;
-        if (!msgObj) return;
+        if (!msgObj) {
+            return res.status(200).send('Ignored: No message object');
+        }
 
         const username = msgObj.from?.username;
         const text = msgObj.text;
@@ -62,10 +65,12 @@ app.post('/telegram/webhook', async (req, res) => {
 
         if (username !== "Hardiksingla07") {
             console.log(`Ignored message from unauthorized user: ${username}`);
-            return;
+            return res.status(200).send('Ignored: Unauthorized');
         }
 
-        if (!text) return; // ignore non-text messages for now
+        if (!text) {
+            return res.status(200).send('Ignored: No text');
+        }
 
         console.log(`Processing Telegram Command: "${text}" from ${username}`);
 
@@ -106,8 +111,12 @@ app.post('/telegram/webhook', async (req, res) => {
                 await sendTelegramReply(chatId, `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).`);
             }
         }
+
+        // ONLY send 200 AFTER everything, including fetch(), is fully complete so Vercel does not terminate the process.
+        res.status(200).send('Telegram webhook processed');
     } catch (error) {
         console.error("Error processing telegram webhook:", error);
+        res.status(500).send('Internal Error');
     }
 });
 

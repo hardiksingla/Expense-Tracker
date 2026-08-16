@@ -111,17 +111,26 @@ async function processExpenseMessage(message) {
     const todayIST = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
     const prompt = `Evaluate the following message: "${message}". If it is a valid expense description containing at least a discernible amount, extract the details precisely. If it is NOT an expense or is missing an amount, set "is_error" to true and populate "error_message" with a short friendly response explaining what is missing. Fill in dummy data (e.g. amount: 0) for the other fields if is_error is true. Assume current year/context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically based on the nature of the expense.`;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: prompt,
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: llmSchema,
-        }
-    });
+    console.log(`[DEBUG] Calling Gemini API...`);
 
-    const parsedText = response.text;
-    const expenseData = JSON.parse(parsedText);
+    let expenseData;
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-3.6-flash',
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: llmSchema,
+            }
+        });
+        console.log(`[DEBUG] Gemini API returned successfully!`);
+
+        const parsedText = response.text;
+        expenseData = JSON.parse(parsedText);
+    } catch (apiError) {
+        console.error(`[DEBUG] ❌ Gemini API threw an error/hung up:`, apiError);
+        return { error: `API Connection Failed: ${apiError.message}. Check if your model name is valid.` };
+    }
 
     if (expenseData.is_error) {
         console.log(`⚠️ Blocked invalid expense due to missing info: ${expenseData.error_message}`);
