@@ -3,10 +3,15 @@ const express = require('express');
 const { processExpenseMessage, getTodayTotal, getMonthTotal, undoLastExpense, getLastExpense } = require('./expenseService');
 
 const app = express();
-const PORT = process.env.PORT || 3005;
+const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(express.json());
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 async function sendTelegramReply(chatId, text) {
     if (!TELEGRAM_BOT_TOKEN) {
