@@ -2,10 +2,13 @@ const { GoogleGenAI } = require('@google/genai');
 const { google } = require('googleapis');
 const fs = require('fs');
 
-// Initialize Gemini
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+// Initialize Gemini keys list
+const GEMINI_API_KEYS = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.split(',').map(k => k.trim()).filter(Boolean) : [];
 
+function getRandomGeminiKey() {
+    if (GEMINI_API_KEYS.length === 0) return null;
+    return GEMINI_API_KEYS[Math.floor(Math.random() * GEMINI_API_KEYS.length)];
+}
 // Setup Google Sheets auth
 let sheets = null;
 try {
@@ -73,17 +76,17 @@ function getMonthSheetName(dateInput = new Date()) {
     return `${monthName} ${year}`;
 }
 
-async function ensureMonthlySheetExists(sheetName) {
-    if (!sheets || !SPREADSHEET_ID) return;
+async function ensureMonthlySheetExists(sheetName, spreadsheetId) {
+    if (!sheets || !spreadsheetId) return;
 
     try {
-        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: spreadsheetId });
         const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName);
 
         if (!sheetExists) {
             console.log(`Creating new sheet for month: ${sheetName}...`);
             await sheets.spreadsheets.batchUpdate({
-                spreadsheetId: SPREADSHEET_ID,
+                spreadsheetId: spreadsheetId,
                 requestBody: {
                     requests: [{
                         addSheet: { properties: { title: sheetName } }
@@ -91,12 +94,12 @@ async function ensureMonthlySheetExists(sheetName) {
                 }
             });
 
-            // Order of headers: Date, Amount, Category, Subcategory, Merchant, Description, Payment Method, Need/Want, AddedAt
-            const headers = [["Date", "Amount", "Category", "Subcategory", "Merchant", "Description", "Payment Method", "Need/Want", "AddedAt"]];
+            // Order of headers: Date, Amount, Category, Subcategory, Merchant, Description, Payment Method, Need/Want, AddedAt, Cumulative Total
+            const headers = [["Date", "Amount", "Category", "Subcategory", "Merchant", "Description", "Payment Method", "Need/Want", "AddedAt", "Cumulative Total"]];
 
             await sheets.spreadsheets.values.append({
-                spreadsheetId: SPREADSHEET_ID,
-                range: `${sheetName}!A1:I1`,
+                spreadsheetId: spreadsheetId,
+                range: `${sheetName}!A1:J1`,
                 valueInputOption: 'USER_ENTERED',
                 requestBody: { values: headers }
             });
@@ -107,29 +110,60 @@ async function ensureMonthlySheetExists(sheetName) {
     }
 }
 
-async function processExpenseMessage(message) {
+async function processExpenseMessage(message, spreadsheetId) {
     const todayIST = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
     const prompt = `Evaluate the following message: "${message}". If it is a valid expense description containing at least a discernible amount, extract the details precisely. If it is NOT an expense or is missing an amount, set "is_error" to true and populate "error_message" with a short friendly response explaining what is missing. Fill in dummy data (e.g. amount: 0) for the other fields if is_error is true. Assume current year/context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically based on the nature of the expense.`;
 
     console.log(`[DEBUG] Calling Gemini API...`);
 
     let expenseData;
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3.6-flash',
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: llmSchema,
-            }
-        });
-        console.log(`[DEBUG] Gemini API returned successfully!`);
+    let success = false;
+    let attempts = 0;
+    const maxAttempts = GEMINI_API_KEYS.length > 0 ? Math.min(GEMINI_API_KEYS.length + 1, 3) : 1;
+    let lastError = null;
 
-        const parsedText = response.text;
-        expenseData = JSON.parse(parsedText);
-    } catch (apiError) {
-        console.error(`[DEBUG] ❌ Gemini API threw an error/hung up:`, apiError);
-        return { error: `API Connection Failed: ${apiError.message}. Check if your model name is valid.` };
+    while (!success && attempts < maxAttempts) {
+        attempts++;
+        const apiKey = GEMINI_API_KEYS.length > 0 ? getRandomGeminiKey() : process.env.GEMINI_API_KEY;
+
+        if (!apiKey) {
+            console.error(`[DEBUG] ❌ No Gemini API Key found in environment variables.`);
+            return { error: `Server Configuration Error: Missing API Key.` };
+        }
+
+        const ai = new GoogleGenAI({ apiKey: apiKey });
+
+        try {
+            const response = await ai.models.generateContent({
+                model: 'gemini-3.6-flash',
+                contents: prompt,
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: llmSchema,
+                }
+            });
+            console.log(`[DEBUG] Gemini API returned successfully on attempt ${attempts}!`);
+
+            const parsedText = response.text;
+            expenseData = JSON.parse(parsedText);
+            success = true;
+        } catch (apiError) {
+            lastError = apiError;
+            console.error(`[DEBUG] ❌ Gemini API threw an error on attempt ${attempts}:`, apiError.message);
+
+            const isRateLimit = apiError.status === 429 ||
+                (apiError.message && (apiError.message.includes('429') || apiError.message.includes('Too Many Requests') || apiError.message.includes('quota')));
+
+            if (isRateLimit && attempts < maxAttempts) {
+                console.log(`⚠️ 429 error encountered limit hit. Retrying with another key...`);
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (!success) {
+        return { error: `API Connection Failed: ${lastError?.message}. Check if your model name is valid.` };
     }
 
     if (expenseData.is_error) {
@@ -144,9 +178,9 @@ async function processExpenseMessage(message) {
 
     console.log("🧠 Parsed Expense Data from Gemini:", JSON.stringify(expenseData, null, 2));
 
-    if (sheets && SPREADSHEET_ID) {
+    if (sheets && spreadsheetId) {
         const sheetName = getMonthSheetName(expenseData.date);
-        await ensureMonthlySheetExists(sheetName);
+        await ensureMonthlySheetExists(sheetName, spreadsheetId);
 
         const values = [[
             expenseData.date,
@@ -157,12 +191,13 @@ async function processExpenseMessage(message) {
             expenseData.description,
             expenseData.payment_method,
             expenseData.need_want,
-            addedAtTime
+            addedAtTime,
+            `=SUM($B$2:INDIRECT("B"&ROW()))`
         ]];
 
         await sheets.spreadsheets.values.append({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${sheetName}!A:I`,
+            spreadsheetId: spreadsheetId,
+            range: `${sheetName}!A:J`,
             valueInputOption: 'USER_ENTERED',
             requestBody: { values }
         });
@@ -171,10 +206,10 @@ async function processExpenseMessage(message) {
     return expenseData;
 }
 
-async function getTodayTotal() {
+async function getTodayTotal(spreadsheetId) {
     if (!sheets) return 0;
     const sheetName = getMonthSheetName();
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName }).catch(() => null);
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
     if (!response || !response.data.values) return 0;
 
     const localToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -189,10 +224,10 @@ async function getTodayTotal() {
     return total;
 }
 
-async function getMonthTotal() {
+async function getMonthTotal(spreadsheetId) {
     if (!sheets) return 0;
     const sheetName = getMonthSheetName();
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName }).catch(() => null);
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
     if (!response || !response.data.values) return 0;
 
     let total = 0;
@@ -203,11 +238,11 @@ async function getMonthTotal() {
     return total;
 }
 
-async function getLastExpense() {
-    if (!sheets || !SPREADSHEET_ID) return null;
+async function getLastExpense(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return null;
     const sheetName = getMonthSheetName();
     try {
-        const response = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName }).catch(() => null);
+        const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
         if (!response || !response.data.values) return null;
 
         const rows = response.data.values;
@@ -248,16 +283,16 @@ async function getLastExpense() {
     }
 }
 
-async function undoLastExpense() {
-    if (!sheets || !SPREADSHEET_ID) return null;
+async function undoLastExpense(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return null;
     const sheetName = getMonthSheetName();
     try {
-        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: spreadsheetId });
         const sheet = spreadsheetInfo.data.sheets.find(s => s.properties.title === sheetName);
         if (!sheet) return null;
         const sheetId = sheet.properties.sheetId;
 
-        const response = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName });
+        const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName });
         const rows = response.data.values || [];
         if (rows.length <= 1) return null; // No data rows
 
@@ -285,7 +320,7 @@ async function undoLastExpense() {
         }
 
         await sheets.spreadsheets.batchUpdate({
-            spreadsheetId: SPREADSHEET_ID,
+            spreadsheetId: spreadsheetId,
             requestBody: {
                 requests: [{
                     deleteDimension: {
