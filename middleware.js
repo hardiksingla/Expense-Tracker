@@ -1,7 +1,6 @@
 const verifyTelegramWebhook = (req, res, next) => {
     const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
-    console.log('Secret Token:', secretToken);
-    console.log('Received Token:', req.headers['x-telegram-bot-api-secret-token']);
+
     // If a secret token is configured in .env, enforce it
     if (secretToken) {
         const receivedToken = req.headers['x-telegram-bot-api-secret-token'];
@@ -25,7 +24,9 @@ const telegramAuthMiddleware = (req, res, next) => {
         return res.status(200).send('Ignored: No username');
     }
 
-    const spreadsheetId = process.env[`${username}_SPREADSHEET_ID`];
+    const targetKey = `${username}_SPREADSHEET_ID`.toLowerCase();
+    const foundKey = Object.keys(process.env).find(k => k.toLowerCase() === targetKey);
+    const spreadsheetId = foundKey ? process.env[foundKey] : undefined;
 
     if (!spreadsheetId) {
         console.log(`Ignored message: No spreadsheet ID found for user: ${username}`);
