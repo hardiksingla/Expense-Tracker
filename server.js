@@ -96,13 +96,15 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/last (view last transaction)\n/undo (remove last expense)`);
         }
         else {
-            // Assume any other text is an expense entry
-            const expenseData = await processExpenseMessage(text, spreadsheetId);
-            if (expenseData.error) {
-                // The LLM determined it didn't have enough info or it wasn't an expense
-                await sendTelegramReply(chatId, `⚠️ Oops! ${expenseData.error}`);
-            } else {
+            const aiResult = await processExpenseMessage(text, spreadsheetId);
+            if (aiResult.error) {
+                // LLM or Service error
+                await sendTelegramReply(chatId, `⚠️ Oops! ${aiResult.error}`);
+            } else if (aiResult.type === 'log') {
+                const expenseData = aiResult.data;
                 await sendTelegramReply(chatId, `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).`);
+            } else if (aiResult.type === 'query' || aiResult.type === 'chat') {
+                await sendTelegramReply(chatId, aiResult.text);
             }
         }
 
