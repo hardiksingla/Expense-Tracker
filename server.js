@@ -88,10 +88,16 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                 await sendTelegramReply(chatId, msg);
             }
         }
-        else if (text === '/overview') {
-            const overviewStr = await getCategoryOverviewThisMonth(spreadsheetId);
+        else if (text.startsWith('/overview')) {
+            const args = text.split(' ');
+            const targetMonth = args.length > 1 ? args.slice(1).join(' ') : null;
+            const overviewStr = await getCategoryOverviewThisMonth(spreadsheetId, targetMonth);
             if (overviewStr) {
-                await sendTelegramReply(chatId, overviewStr);
+                if (overviewStr.error) {
+                    await sendTelegramReply(chatId, `⚠️ ${overviewStr.error}`);
+                } else {
+                    await sendTelegramReply(chatId, overviewStr);
+                }
             } else {
                 await sendTelegramReply(chatId, "⚠️ Could not fetch overview. Ensure Google Sheets is configured.");
             }

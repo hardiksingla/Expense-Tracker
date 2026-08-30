@@ -319,11 +319,31 @@ async function getAveragePerDayThisMonth(spreadsheetId) {
     };
 }
 
-async function getCategoryOverviewThisMonth(spreadsheetId) {
+async function getCategoryOverviewThisMonth(spreadsheetId, targetMonthStr = null) {
     if (!sheets) return null;
-    const sheetName = getMonthSheetName();
+
+    let sheetName = getMonthSheetName();
+    const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    let daysPast = todayIST.getDate();
+    let displayTitle = "this Month";
+
+    if (targetMonthStr) {
+        const currentYear = todayIST.getFullYear();
+        const parseStr = /\d/.test(targetMonthStr) ? targetMonthStr : `${targetMonthStr} 1, ${currentYear}`;
+        const ts = Date.parse(parseStr);
+        if (!isNaN(ts)) {
+            const targetDate = new Date(ts);
+            sheetName = getMonthSheetName(targetDate);
+            displayTitle = `for ${sheetName}`;
+            if (sheetName !== getMonthSheetName(todayIST)) {
+                // If it's a past/future month, use total days in that month
+                daysPast = new Date(targetDate.getFullYear(), targetDate.getMonth() + 1, 0).getDate();
+            }
+        }
+    }
+
     const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
-    if (!response || !response.data.values) return null;
+    if (!response || !response.data.values) return { error: `Could not find data for ${sheetName}.` };
 
     const rows = response.data.values;
     const categoryTotals = {};
@@ -337,10 +357,7 @@ async function getCategoryOverviewThisMonth(spreadsheetId) {
         totalSpend += amount;
     }
 
-    const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    const daysPast = todayIST.getDate();
-
-    let overviewString = "📊 Category Overview this Month:\n";
+    let overviewString = `📊 Category Overview ${displayTitle}:\n`;
     for (const [cat, total] of Object.entries(categoryTotals)) {
         const avg = daysPast > 0 ? total / daysPast : 0;
         overviewString += `\n${cat}: ₹${total.toFixed(2)} (Avg: ₹${avg.toFixed(2)}/day)`;
