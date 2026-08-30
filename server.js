@@ -78,7 +78,8 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
         }
         else if (text === '/avg') {
             const avg = await getAveragePerDayThisMonth(spreadsheetId);
-            await sendTelegramReply(chatId, `This Month's Average Per Day: ₹${avg.toFixed(2)}`);
+            const projected = avg * 30;
+            await sendTelegramReply(chatId, `This Month's Average Per Day: ₹${avg.toFixed(2)}\nProjected Monthly Total: ₹${projected.toFixed(2)}`);
         }
         else if (text === '/undo') {
             const deletedAmount = await undoLastExpense(spreadsheetId);
