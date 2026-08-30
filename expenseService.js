@@ -161,7 +161,6 @@ async function processExpenseMessage(message, spreadsheetId) {
                     tools: geminiTools
                 }
             });
-            console.log(`[DEBUG] Gemini API returned successfully on attempt ${attempts}!`);
 
             const functionCall = response.functionCalls?.[0];
 
@@ -292,13 +291,65 @@ async function getMonthTotal(spreadsheetId) {
 }
 
 async function getAveragePerDayThisMonth(spreadsheetId) {
-    const total = await getMonthTotal(spreadsheetId);
-    if (total === 0) return 0;
+    if (!sheets) return null;
+    const sheetName = getMonthSheetName();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
+    if (!response || !response.data.values) return null;
+
+    let total = 0;
+    const rows = response.data.values;
+    const transactionCount = rows.length > 1 ? rows.length - 1 : 0;
+    for (let i = 1; i < rows.length; i++) {
+        total += parseFloat(rows[i][1]) || 0;
+    }
+
+    const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const daysPast = todayIST.getDate();
+    const average = daysPast > 0 ? total / daysPast : 0;
+    const monthName = todayIST.toLocaleString('default', { month: 'long' });
+    const year = todayIST.getFullYear();
+
+    return {
+        total,
+        transactionCount,
+        daysPast,
+        average,
+        monthName,
+        year
+    };
+}
+
+async function getCategoryOverviewThisMonth(spreadsheetId) {
+    if (!sheets) return null;
+    const sheetName = getMonthSheetName();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
+    if (!response || !response.data.values) return null;
+
+    const rows = response.data.values;
+    const categoryTotals = {};
+    let totalSpend = 0;
+
+    for (let i = 1; i < rows.length; i++) {
+        const amount = parseFloat(rows[i][1]) || 0;
+        const category = rows[i][2] || "Uncategorized";
+        if (!categoryTotals[category]) categoryTotals[category] = 0;
+        categoryTotals[category] += amount;
+        totalSpend += amount;
+    }
 
     const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const daysPast = todayIST.getDate();
 
-    return daysPast > 0 ? total / daysPast : 0;
+    let overviewString = "📊 Category Overview this Month:\n";
+    for (const [cat, total] of Object.entries(categoryTotals)) {
+        const avg = daysPast > 0 ? total / daysPast : 0;
+        overviewString += `\n${cat}: ₹${total.toFixed(2)} (Avg: ₹${avg.toFixed(2)}/day)`;
+    }
+
+    const totalAvg = daysPast > 0 ? totalSpend / daysPast : 0;
+    overviewString += `\n\n💰 **Total Spend: ₹${totalSpend.toFixed(2)}** (Avg: ₹${totalAvg.toFixed(2)}/day)`;
+
+    return overviewString;
 }
 
 async function queryExpenses(startDate, endDate, category, spreadsheetId) {
@@ -318,11 +369,18 @@ async function queryExpenses(startDate, endDate, category, spreadsheetId) {
     // Also add the end date's month just in case
     monthsToFetch.add(getMonthSheetName(end));
 
+    // To prevent checking 600+ months if AI hallucinates 1970 start date, let's fetch available sheets first.
+    const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId }).catch(() => null);
+    if (!spreadsheetInfo) return { error: "Could not fetch spreadsheet data." };
+
+    const availableSheets = new Set(spreadsheetInfo.data.sheets.map(s => s.properties.title));
+    const sheetsToQuery = Array.from(monthsToFetch).filter(s => availableSheets.has(s));
+
     let totalAmount = 0;
     let transactions = [];
 
     // Try fetching every relevant month sheet
-    for (const sheetName of monthsToFetch) {
+    for (const sheetName of sheetsToQuery) {
         const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: sheetName }).catch(() => null);
         if (!response || !response.data.values) continue;
 
@@ -464,6 +522,7 @@ module.exports = {
     getTodayTotal,
     getMonthTotal,
     getAveragePerDayThisMonth,
+    getCategoryOverviewThisMonth,
     undoLastExpense,
     getLastExpense
 };

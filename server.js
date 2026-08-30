@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
+const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware');
 
 const app = express();
@@ -55,6 +55,8 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
     const payload = req.body;
     console.log(payload);
 
+    // return res.status(200).send('Webhook processed');
+
     try {
         // Safe access Telegram message payload
         const msgObj = payload?.message;
@@ -77,9 +79,22 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             await sendTelegramReply(chatId, `This Month's Total Expenses: ₹${total.toFixed(2)}`);
         }
         else if (text === '/avg') {
-            const avg = await getAveragePerDayThisMonth(spreadsheetId);
-            const projected = avg * 30;
-            await sendTelegramReply(chatId, `This Month's Average Per Day: ₹${avg.toFixed(2)}\nProjected Monthly Total: ₹${projected.toFixed(2)}`);
+            const stats = await getAveragePerDayThisMonth(spreadsheetId);
+            if (!stats) {
+                await sendTelegramReply(chatId, "⚠️ Could not fetch average. Ensure Google Sheets is configured.");
+            } else {
+                const projected = stats.average * 30;
+                const msg = `Your total expenses for this month (${stats.monthName} 1 to ${stats.monthName} ${stats.daysPast}, ${stats.year}) are **₹${stats.total.toFixed(2)}** across ${stats.transactionCount} transactions.\n\nOver the ${stats.daysPast} days so far, your average daily expense is **₹${stats.average.toFixed(2)} per day**.\n\nProjected Monthly Total: **₹${projected.toFixed(2)}**`;
+                await sendTelegramReply(chatId, msg);
+            }
+        }
+        else if (text === '/overview') {
+            const overviewStr = await getCategoryOverviewThisMonth(spreadsheetId);
+            if (overviewStr) {
+                await sendTelegramReply(chatId, overviewStr);
+            } else {
+                await sendTelegramReply(chatId, "⚠️ Could not fetch overview. Ensure Google Sheets is configured.");
+            }
         }
         else if (text === '/undo') {
             const deletedAmount = await undoLastExpense(spreadsheetId);
@@ -98,7 +113,7 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/start') {
-            await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/avg (see month's average per day)\n/last (view last transaction)\n/undo (remove last expense)`);
+            await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/avg (see month's average per day)\n/overview (category breakdown)\n/last (view last transaction)\n/undo (remove last expense)`);
         }
         else {
             const aiResult = await processExpenseMessage(text, spreadsheetId);
