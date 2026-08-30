@@ -291,6 +291,16 @@ async function getMonthTotal(spreadsheetId) {
     return total;
 }
 
+async function getAveragePerDayThisMonth(spreadsheetId) {
+    const total = await getMonthTotal(spreadsheetId);
+    if (total === 0) return 0;
+
+    const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const daysPast = todayIST.getDate();
+
+    return daysPast > 0 ? total / daysPast : 0;
+}
+
 async function queryExpenses(startDate, endDate, category, spreadsheetId) {
     if (!sheets) return { error: "Google Sheets not configured." };
 
@@ -453,6 +463,7 @@ module.exports = {
     processExpenseMessage,
     getTodayTotal,
     getMonthTotal,
+    getAveragePerDayThisMonth,
     undoLastExpense,
     getLastExpense
 };

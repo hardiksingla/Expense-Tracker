@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, getTodayTotal, getMonthTotal, undoLastExpense, getLastExpense } = require('./expenseService');
+const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware');
 
 const app = express();
@@ -76,6 +76,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             const total = await getMonthTotal(spreadsheetId);
             await sendTelegramReply(chatId, `This Month's Total Expenses: ₹${total.toFixed(2)}`);
         }
+        else if (text === '/avg') {
+            const avg = await getAveragePerDayThisMonth(spreadsheetId);
+            await sendTelegramReply(chatId, `This Month's Average Per Day: ₹${avg.toFixed(2)}`);
+        }
         else if (text === '/undo') {
             const deletedAmount = await undoLastExpense(spreadsheetId);
             if (deletedAmount !== null) {
@@ -93,7 +97,7 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/start') {
-            await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/last (view last transaction)\n/undo (remove last expense)`);
+            await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/avg (see month's average per day)\n/last (view last transaction)\n/undo (remove last expense)`);
         }
         else {
             const aiResult = await processExpenseMessage(text, spreadsheetId);
