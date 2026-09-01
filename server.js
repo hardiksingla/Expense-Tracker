@@ -9,6 +9,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(express.json());
 
+// Idempotency cache: store recently processed update IDs
+const processedUpdates = new Set();
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -58,6 +60,20 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
     // return res.status(200).send('Webhook processed');
 
     try {
+        const updateId = payload?.update_id;
+        if (updateId) {
+            if (processedUpdates.has(updateId)) {
+                console.log(`[Idempotency] Ignoring already processed update_id: ${updateId}`);
+                return res.status(200).send('Ignored: Already processed');
+            }
+            processedUpdates.add(updateId);
+            // Keep cache size bounded
+            if (processedUpdates.size > 200) {
+                const first = processedUpdates.values().next().value;
+                processedUpdates.delete(first);
+            }
+        }
+
         // Safe access Telegram message payload
         const msgObj = payload?.message;
         const { username, spreadsheetId } = req;

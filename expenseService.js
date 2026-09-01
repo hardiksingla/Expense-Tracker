@@ -131,7 +131,7 @@ async function ensureMonthlySheetExists(sheetName, spreadsheetId) {
 }
 
 async function processExpenseMessage(message, spreadsheetId) {
-    const todayIST = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
     const prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
 
     console.log(`[DEBUG] Calling Gemini API...`);
