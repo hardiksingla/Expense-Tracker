@@ -166,7 +166,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                 if (result.error) {
                     await sendTelegramReply(chatId, result.error);
                 } else {
-                    await sendTelegramReply(chatId, `Receipt recorded: ₹${result.data.amount} for ${result.data.category}.`);
+                    const owedMessage = result.owed?.length
+                        ? ` Owed: ${result.owed.map(entry => `${entry.name} ₹${entry.amount}`).join(', ')}.`
+                        : '';
+                    await sendTelegramReply(chatId, `Receipt recorded: ₹${result.data.amount} for ${result.data.category}.${owedMessage}`);
                 }
             } catch (error) {
                 console.error('Receipt webhook failed:', error.message);

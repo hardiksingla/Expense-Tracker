@@ -318,7 +318,7 @@ function parseSplitExpenseMessage(message) {
         };
     }
 
-    const equalMatch = splitInstruction.match(/^split\s+equally\s+between\s+(.+)$/i);
+    const equalMatch = splitInstruction.match(/^(?:split\s+equally|split|divide|share)\s+between\s+(.+)$/i);
     if (equalMatch) {
         const people = equalMatch[1]
             .replace(/\s+and\s+/gi, ',')
@@ -627,7 +627,7 @@ async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId
     if (!apiKey) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
 
     const ai = new GoogleGenAI({ apiKey });
-    const prompt = `Read this receipt and record one expense. ${caption ? `The user's note is: "${caption}".` : ''} Extract only information visible in the receipt. If the amount is unclear, set is_error to true. Use today's date in India if no date is visible. Call logExpense and do not provide a conversational answer.`;
+    const prompt = `Read this receipt and extract the FULL final payable amount printed on it, before applying any split. ${caption ? `The user's note is: "${caption}". Treat this note only as an instruction for how to divide the full receipt total after extraction; never halve or otherwise change the amount because of the note.` : ''} Extract only information visible in the receipt. If the full payable amount is unclear, set is_error to true. Use today's date in India if no date is visible. Call logExpense and do not provide a conversational answer.`;
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-3.6-flash',
