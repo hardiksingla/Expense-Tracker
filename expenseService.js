@@ -1,6 +1,7 @@
 const { GoogleGenAI } = require('@google/genai');
 const { google } = require('googleapis');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Initialize Gemini keys list
 const GEMINI_API_KEYS = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.split(',').map(k => k.trim()).filter(Boolean) : [];
@@ -115,24 +116,418 @@ async function ensureMonthlySheetExists(sheetName, spreadsheetId) {
             });
 
             // Order of headers: Date, Amount, Category, Subcategory, Merchant, Description, Payment Method, Need/Want, AddedAt, Cumulative Total
-            const headers = [["Date", "Amount", "Category", "Subcategory", "Merchant", "Description", "Payment Method", "Need/Want", "AddedAt", "Cumulative Total"]];
+            const headers = [["Date", "Amount", "Category", "Subcategory", "Merchant", "Description", "Payment Method", "Need/Want", "AddedAt", "Cumulative Total", "Transaction ID"]];
 
             await sheets.spreadsheets.values.append({
                 spreadsheetId: spreadsheetId,
-                range: `${sheetName}!A1:J1`,
+                range: `${sheetName}!A1:K1`,
                 valueInputOption: 'USER_ENTERED',
                 requestBody: { values: headers }
             });
             console.log(`✅ Successfully initialized sheet: ${sheetName}`);
+        } else {
+            const headerResponse = await sheets.spreadsheets.values.get({
+                spreadsheetId,
+                range: `${sheetName}!A1:K1`
+            });
+            if ((headerResponse.data.values?.[0] || [])[10] !== 'Transaction ID') {
+                await sheets.spreadsheets.values.update({
+                    spreadsheetId,
+                    range: `${sheetName}!K1`,
+                    valueInputOption: 'RAW',
+                    requestBody: { values: [['Transaction ID']] }
+                });
+            }
         }
     } catch (error) {
         console.error(`❌ Error checking/creating monthly sheet:`, error.message);
     }
 }
 
-async function processExpenseMessage(message, spreadsheetId) {
+async function ensureOwedSheetExists(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return;
+
+    const sheetName = 'Owed';
+    try {
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName);
+
+        if (!sheetExists) {
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId,
+                requestBody: {
+                    requests: [{ addSheet: { properties: { title: sheetName } } }]
+                }
+            });
+
+            const headers = [[
+                'Date', 'Name', 'Amount Owed', 'Expense Amount', 'Description', 'AddedAt', 'Total Owed By Person', 'Reason / Note', 'Transaction ID'
+            ]];
+            await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${sheetName}!A1:I1`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: headers }
+            });
+        } else {
+            const headerResponse = await sheets.spreadsheets.values.get({
+                spreadsheetId,
+                range: `${sheetName}!A1:I1`
+            });
+            const headers = headerResponse.data.values?.[0] || [];
+            if (headers[7] !== 'Reason / Note') {
+                await sheets.spreadsheets.values.update({
+                    spreadsheetId,
+                    range: `${sheetName}!H1`,
+                    valueInputOption: 'RAW',
+                    requestBody: { values: [['Reason / Note']] }
+                });
+            }
+            if (headers[8] !== 'Transaction ID') {
+                await sheets.spreadsheets.values.update({
+                    spreadsheetId,
+                    range: `${sheetName}!I1`,
+                    valueInputOption: 'RAW',
+                    requestBody: { values: [['Transaction ID']] }
+                });
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error checking/creating Owed sheet:', error.message);
+    }
+}
+
+async function ensureBudgetSheetExists(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return false;
+
+    const sheetName = 'Budget';
+    try {
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName);
+        if (!sheetExists) {
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId,
+                requestBody: {
+                    requests: [{ addSheet: { properties: { title: sheetName } } }]
+                }
+            });
+            await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${sheetName}!A1:C1`,
+                valueInputOption: 'RAW',
+                requestBody: { values: [['Month', 'Budget', 'UpdatedAt']] }
+            });
+        }
+        return true;
+    } catch (error) {
+        console.error('Error checking/creating Budget sheet:', error.message);
+        return false;
+    }
+}
+
+async function ensureLimitsSheetExists(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return false;
+    try {
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        if (!spreadsheetInfo.data.sheets.some(sheet => sheet.properties.title === 'Limits')) {
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId,
+                requestBody: { requests: [{ addSheet: { properties: { title: 'Limits' } } }] }
+            });
+            await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: 'Limits!A1:C1',
+                valueInputOption: 'RAW',
+                requestBody: { values: [['Category', 'Monthly Limit', 'UpdatedAt']] }
+            });
+        }
+        return true;
+    } catch (error) {
+        console.error('Error checking/creating Limits sheet:', error.message);
+        return false;
+    }
+}
+
+function parseSplitExpenseMessage(message) {
+    const text = message.trim();
+    const amountMatch = text.match(/^(\d+(?:\.\d+)?)(.*)$/);
+    if (!amountMatch) return null;
+
+    const originalAmount = Number(amountMatch[1]);
+    const body = amountMatch[2].trim();
+    const reasonMatch = body.match(/^\(([^)]+)\)/);
+    const reason = reasonMatch?.[1]?.trim() || 'Split expense';
+    const splitInstruction = body.replace(/^\([^)]*\)\s*/, '').replace(/^[-:]\s*/, '').trim();
+
+    const groupedSplitMatch = splitInstruction.match(/^(\d+(?:\.\d+)?)\s*\(([^)]+)\)\s*,\s*rest\s*\(([^)]+)\)$/i);
+    if (groupedSplitMatch) {
+        const fixedAmount = Number(groupedSplitMatch[1]);
+        const fixedPeople = groupedSplitMatch[2]
+            .split(',')
+            .map(name => name.trim())
+            .filter(Boolean);
+        const remainderPeople = groupedSplitMatch[3]
+            .split(',')
+            .map(name => name.trim())
+            .filter(Boolean);
+
+        if (fixedPeople.length === 0 || remainderPeople.length === 0 || fixedAmount > originalAmount) {
+            return null;
+        }
+
+        const fixedShare = Number((fixedAmount / fixedPeople.length).toFixed(2));
+        const fixedTotal = Number((fixedShare * fixedPeople.length).toFixed(2));
+        const remainder = Number((originalAmount - fixedAmount).toFixed(2));
+        const remainderShare = Number((remainder / remainderPeople.length).toFixed(2));
+        const owedEntries = [];
+
+        for (const name of fixedPeople) {
+            if (!/^(me|myself|i)$/i.test(name)) {
+                owedEntries.push({ amount: fixedShare, name });
+            }
+        }
+        for (let index = 0; index < remainderPeople.length; index++) {
+            const name = remainderPeople[index];
+            if (!/^(me|myself|i)$/i.test(name)) {
+                const amount = index === remainderPeople.length - 1
+                    ? Number((remainder - remainderShare * (remainderPeople.length - 1)).toFixed(2))
+                    : remainderShare;
+                owedEntries.push({ amount, name });
+            }
+        }
+
+        const personalShare = Number((originalAmount - owedEntries.reduce((sum, entry) => sum + entry.amount, 0)).toFixed(2));
+        return {
+            amount: personalShare,
+            originalAmount,
+            owedEntries,
+            reason
+        };
+    }
+
+    if (/\brest\s+(?:is\s+)?(?:divide|divided)\s+by\s+\d+/i.test(splitInstruction)) {
+        const remainderMatch = splitInstruction.match(/^(\d+(?:\.\d+)?)\s+(?:me|myself|i)\s*,\s*rest\s+(?:is\s+)?(?:divide|divided)\s+by\s+(\d+)/i);
+        return {
+            error: 'Please reply with the names of the people included in the remaining split, separated by commas.',
+            pending: remainderMatch ? {
+                originalAmount,
+                personalAmount: Number(remainderMatch[1]),
+                peopleCount: Number(remainderMatch[2]),
+                reason
+            } : null
+        };
+    }
+
+    const equalMatch = splitInstruction.match(/^(?:split\s+equally|split|divide|share)\s+between\s+(.+)$/i);
+    if (equalMatch) {
+        const people = equalMatch[1]
+            .replace(/\s+and\s+/gi, ',')
+            .split(',')
+            .map(name => name.trim())
+            .filter(Boolean);
+        const owedPeople = people.filter(name => !/^(me|myself|i)$/i.test(name));
+        if (people.length < 2 || owedPeople.length === 0) return null;
+
+        const share = Number((originalAmount / people.length).toFixed(2));
+        return {
+            amount: Number((originalAmount - share * owedPeople.length).toFixed(2)),
+            originalAmount,
+            owedEntries: owedPeople.map(name => ({ amount: share, name })),
+            reason: reasonMatch?.[1]?.trim() || 'Split equally'
+        };
+    }
+
+    if (!splitInstruction) return null;
+
+    const owedEntries = splitInstruction.split(',').map(entry => {
+        const entryMatch = entry.match(/^\s*(\d+(?:\.\d+)?)\s+(.+?)\s*$/);
+        if (!entryMatch) return null;
+        return { amount: Number(entryMatch[1]), name: entryMatch[2].trim() };
+    });
+
+    if (owedEntries.some(entry => !entry) || owedEntries.length === 0) return null;
+
+    const totalOwed = owedEntries.reduce((total, entry) => total + entry.amount, 0);
+    const remainingAmount = Number((originalAmount - totalOwed).toFixed(2));
+    if (remainingAmount < 0) return null;
+
+    return {
+        amount: remainingAmount,
+        originalAmount,
+        owedEntries,
+        reason: reasonMatch?.[1]?.trim() || 'Split expense'
+    };
+}
+
+function completePendingSplit(pending, namesMessage) {
+    const names = namesMessage
+        .replace(/^names?\s*(?:are|:)?\s*/i, '')
+        .replace(/\s+and\s+/gi, ',')
+        .split(',')
+        .map(name => name.trim())
+        .filter(Boolean);
+
+    if (names.length !== pending.peopleCount) {
+        return { error: `Please provide exactly ${pending.peopleCount} names, separated by commas.` };
+    }
+    if (names.some(name => /^(me|myself|i)$/i.test(name))) {
+        return { error: 'Please provide the names of the other people. Your personal share is already recorded.' };
+    }
+
+    const remainder = Number((pending.originalAmount - pending.personalAmount).toFixed(2));
+    if (remainder < 0 || pending.personalAmount < 0) {
+        return { error: 'The personal share cannot be greater than the total transaction amount.' };
+    }
+
+    const baseShare = Number((remainder / pending.peopleCount).toFixed(2));
+    const owedEntries = names.map((name, index) => ({
+        name,
+        amount: index === names.length - 1
+            ? Number((remainder - baseShare * (names.length - 1)).toFixed(2))
+            : baseShare
+    }));
+    return {
+        amount: pending.personalAmount,
+        originalAmount: pending.originalAmount,
+        owedEntries,
+        reason: pending.reason
+    };
+}
+
+async function appendOwedEntries(splitData, date, addedAtTime, transactionId, spreadsheetId) {
+    if (!sheets || !spreadsheetId) return;
+
+    await ensureOwedSheetExists(spreadsheetId);
+    const existingRowsResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: 'Owed!A:A'
+    });
+    const firstDataRow = (existingRowsResponse.data.values || []).length + 1;
+    const values = splitData.owedEntries.map((entry, index) => [
+        date,
+        entry.name,
+        entry.amount,
+        splitData.originalAmount,
+        `Split expense of ₹${splitData.originalAmount}`,
+        addedAtTime,
+        `=SUMIF($B$2:$B,B${firstDataRow + index},$C$2:$C)`,
+        splitData.reason,
+        transactionId
+    ]);
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'Owed!A:I',
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values }
+    });
+}
+
+async function recordExpenseData(expenseData, spreadsheetId) {
+    if (expenseData.is_error) return { error: expenseData.error_message };
+
+    const normalizedAmount = Number(expenseData.amount);
+    if (!Number.isFinite(normalizedAmount)) {
+        return { error: 'I need a clear numeric amount before I can record that expense.' };
+    }
+    expenseData.amount = Number(normalizedAmount.toFixed(2));
+    if (!CATEGORIES.includes(expenseData.category)) expenseData.category = 'Miscellaneous';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(expenseData.date) || Number.isNaN(Date.parse(expenseData.date))) {
+        expenseData.date = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    }
+    expenseData.description = String(expenseData.description || expenseData.merchant || 'Expense').trim();
+    expenseData.subcategory = String(expenseData.subcategory || 'General').trim();
+    expenseData.merchant = String(expenseData.merchant || 'Unknown').trim();
+    expenseData.payment_method = String(expenseData.payment_method || 'UPI').trim();
+    expenseData.need_want = expenseData.need_want === 'Want' ? 'Want' : 'Need';
+
+    const transactionId = crypto.randomUUID();
+    expenseData.transactionId = transactionId;
+    const d = new Date();
+    const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
+    const addedAtTime = `${datePart} ${timePart}`;
+
+    if (sheets && spreadsheetId) {
+        const sheetName = getMonthSheetName(expenseData.date);
+        await ensureMonthlySheetExists(sheetName, spreadsheetId);
+        await sheets.spreadsheets.values.append({
+            spreadsheetId,
+            range: `${sheetName}!A:K`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values: [[
+                expenseData.date,
+                expenseData.amount,
+                expenseData.category,
+                expenseData.subcategory,
+                expenseData.merchant,
+                expenseData.description,
+                expenseData.payment_method,
+                expenseData.need_want,
+                addedAtTime,
+                '=SUM($B$2:INDIRECT("B"&ROW()))',
+                transactionId
+            ]] }
+        });
+    }
+    return { type: 'log', data: expenseData };
+}
+
+async function recordSplitExpense(splitData, spreadsheetId) {
+    const transactionId = crypto.randomUUID();
+    const datePart = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const timePart = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
+    const expenseData = {
+        is_error: false,
+        amount: splitData.amount,
+        category: 'Miscellaneous',
+        subcategory: 'Split expense',
+        description: `Paid ₹${splitData.originalAmount}; ${splitData.owedEntries.map(entry => `${entry.name} owes ₹${entry.amount}`).join(', ')}`,
+        merchant: 'Split expense',
+        payment_method: 'UPI',
+        need_want: 'Need',
+        date: datePart,
+        transactionId
+    };
+    const addedAtTime = `${datePart} ${timePart}`;
+
+    if (sheets && spreadsheetId) {
+        const sheetName = getMonthSheetName(expenseData.date);
+        await ensureMonthlySheetExists(sheetName, spreadsheetId);
+        await sheets.spreadsheets.values.append({
+            spreadsheetId,
+            range: `${sheetName}!A:K`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values: [[
+                expenseData.date,
+                expenseData.amount,
+                expenseData.category,
+                expenseData.subcategory,
+                expenseData.merchant,
+                expenseData.description,
+                expenseData.payment_method,
+                expenseData.need_want,
+                addedAtTime,
+                '=SUM($B$2:INDIRECT("B"&ROW()))',
+                transactionId
+            ]] }
+        });
+        await appendOwedEntries(splitData, datePart, addedAtTime, transactionId, spreadsheetId);
+    }
+    return { type: 'log', data: expenseData, owed: splitData.owedEntries };
+}
+
+async function processExpenseMessage(message, spreadsheetId, splitOverride = null) {
+    const splitData = splitOverride || parseSplitExpenseMessage(message);
+    if (splitData?.error) {
+        return { error: splitData.error, pending: splitData.pending };
+    }
+    if (splitData) {
+        return recordSplitExpense(splitData, spreadsheetId);
+    }
+
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
+    const prompt = `You are a discreet, capable personal finance butler. Evaluate this message: "${message}". Decide whether the user wants to record an expense, query spending, or chat. For an expense, call logExpense only when the amount is clear; never invent a real amount, merchant, or date. If essential information is missing, set is_error to true and ask one concise clarification. Negative amounts are income and must remain negative. For queries, call queryExpenses. Use today's date in India when no date is given: ${todayIST}. Default payment_method to "UPI" only when it is not stated. Choose need_want conservatively: recurring essentials are Needs, discretionary purchases are Wants. Be practical and gently point out useful context when replying, but do not lecture. Keep replies concise, plain text, and free of Markdown markers and emojis.`;
 
     console.log(`[DEBUG] Calling Gemini API...`);
 
@@ -219,43 +614,52 @@ async function processExpenseMessage(message, spreadsheetId) {
             return { error: expenseData.error_message };
         }
 
-        const d = new Date();
-        const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-        const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
-        const addedAtTime = `${datePart} ${timePart}`;
-
         console.log("🧠 Parsed Expense Data from Gemini:", JSON.stringify(expenseData, null, 2));
-
-        if (sheets && spreadsheetId) {
-            const sheetName = getMonthSheetName(expenseData.date);
-            await ensureMonthlySheetExists(sheetName, spreadsheetId);
-
-            const values = [[
-                expenseData.date,
-                expenseData.amount,
-                expenseData.category,
-                expenseData.subcategory,
-                expenseData.merchant,
-                expenseData.description,
-                expenseData.payment_method,
-                expenseData.need_want,
-                addedAtTime,
-                `=SUM($B$2:INDIRECT("B"&ROW()))`
-            ]];
-
-            await sheets.spreadsheets.values.append({
-                spreadsheetId: spreadsheetId,
-                range: `${sheetName}!A:J`,
-                valueInputOption: 'USER_ENTERED',
-                requestBody: { values }
-            });
-        }
-
-        return { type: 'log', data: expenseData };
+        return recordExpenseData(expenseData, spreadsheetId);
     }
 
     // Pass through query or chat results
     return resultPayload;
+}
+
+async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId) {
+    const apiKey = getRandomGeminiKey();
+    if (!apiKey) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
+
+    const ai = new GoogleGenAI({ apiKey });
+    const prompt = `Read this receipt and extract the FULL final payable amount printed on it, before applying any split. ${caption ? `The user's note is: "${caption}". Treat this note only as an instruction for how to divide the full receipt total after extraction; never halve or otherwise change the amount because of the note.` : ''} Extract only information visible in the receipt. If the full payable amount is unclear, set is_error to true. Use today's date in India if no date is visible. Call logExpense and do not provide a conversational answer.`;
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-3.6-flash',
+            contents: [{
+                role: 'user',
+                parts: [
+                    { text: prompt },
+                    { inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBuffer.toString('base64') } }
+                ]
+            }],
+            config: { tools: geminiTools }
+        });
+        const functionCall = response.functionCalls?.[0];
+        if (!functionCall || functionCall.name !== 'logExpense') {
+            return { error: 'I could not read a clear expense from that receipt.' };
+        }
+        const expenseData = functionCall.args;
+        if (caption) {
+            const captionSplit = parseSplitExpenseMessage(caption) ||
+                parseSplitExpenseMessage(`${expenseData.amount} ${caption}`);
+            if (captionSplit?.owedEntries?.length) {
+                if (!captionSplit.reason || captionSplit.reason === 'Split expense') {
+                    captionSplit.reason = expenseData.merchant || 'Receipt split';
+                }
+                return recordSplitExpense(captionSplit, spreadsheetId);
+            }
+        }
+        return recordExpenseData(expenseData, spreadsheetId);
+    } catch (error) {
+        console.error('Receipt parsing failed:', error.message);
+        return { error: 'I could not read that receipt. Please send a clearer image or enter the amount manually.' };
+    }
 }
 
 async function getTodayTotal(spreadsheetId) {
@@ -288,6 +692,231 @@ async function getMonthTotal(spreadsheetId) {
         total += parseFloat(rows[i][1]) || 0;
     }
     return total;
+}
+
+async function setMonthlyBudget(amount, spreadsheetId) {
+    const budget = Number(amount);
+    if (!Number.isFinite(budget) || budget <= 0) {
+        return { error: 'Please provide a monthly budget greater than zero.' };
+    }
+    if (!await ensureBudgetSheetExists(spreadsheetId)) {
+        return { error: 'Google Sheets is not configured.' };
+    }
+
+    const month = getMonthSheetName();
+    const updatedAt = new Date().toISOString();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Budget!A:C' });
+    const rows = response.data.values || [];
+    const rowIndex = rows.findIndex(row => row[0] === month);
+    const values = [[month, budget, updatedAt]];
+
+    if (rowIndex >= 1) {
+        await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `Budget!A${rowIndex + 1}:C${rowIndex + 1}`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values }
+        });
+    } else {
+        await sheets.spreadsheets.values.append({
+            spreadsheetId,
+            range: 'Budget!A:C',
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values }
+        });
+    }
+    return { month, budget };
+}
+
+async function getBudgetStatus(spreadsheetId) {
+    if (!await ensureBudgetSheetExists(spreadsheetId)) {
+        return { error: 'Google Sheets is not configured.' };
+    }
+
+    const month = getMonthSheetName();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Budget!A:C' });
+    const row = (response.data.values || []).find(values => values[0] === month);
+    if (!row || !Number.isFinite(Number(row[1]))) {
+        return { month, budget: null, spent: await getMonthTotal(spreadsheetId) };
+    }
+
+    const budget = Number(row[1]);
+    const spent = await getMonthTotal(spreadsheetId);
+    const today = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const daysInMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+    const dayOfMonth = today.getDate();
+    const expectedSpend = (budget / daysInMonth) * dayOfMonth;
+    return {
+        month,
+        budget,
+        spent,
+        remaining: budget - spent,
+        expectedSpend
+    };
+}
+
+async function setCategoryLimit(category, amount, spreadsheetId) {
+    const matchedCategory = CATEGORIES.find(item => item.toLowerCase() === String(category).trim().toLowerCase());
+    const limit = Number(amount);
+    if (!matchedCategory || !Number.isFinite(limit) || limit <= 0) {
+        return { error: `Use /limit Category Amount. Category must be one of: ${CATEGORIES.join(', ')}.` };
+    }
+    if (!await ensureLimitsSheetExists(spreadsheetId)) return { error: 'Google Sheets is not configured.' };
+
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Limits!A:C' });
+    const rows = response.data.values || [];
+    const rowIndex = rows.findIndex(row => String(row[0]).toLowerCase() === matchedCategory.toLowerCase());
+    const values = [[matchedCategory, Number(limit.toFixed(2)), new Date().toISOString()]];
+    if (rowIndex >= 1) {
+        await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `Limits!A${rowIndex + 1}:C${rowIndex + 1}`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values }
+        });
+    } else {
+        await sheets.spreadsheets.values.append({ spreadsheetId, range: 'Limits!A:C', valueInputOption: 'USER_ENTERED', requestBody: { values } });
+    }
+    return { category: matchedCategory, limit };
+}
+
+async function getCategoryLimitStatuses(spreadsheetId) {
+    if (!await ensureLimitsSheetExists(spreadsheetId)) return { error: 'Google Sheets is not configured.' };
+    const limitResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Limits!A:C' });
+    const expenseResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${getMonthSheetName()}!A:K` }).catch(() => null);
+    const totals = {};
+    for (const row of (expenseResponse?.data?.values || []).slice(1)) {
+        const category = row[2];
+        const amount = Number(row[1]);
+        if (category && Number.isFinite(amount)) totals[category] = (totals[category] || 0) + amount;
+    }
+    return (limitResponse.data.values || []).slice(1).filter(row => row[0] && Number.isFinite(Number(row[1]))).map(row => ({
+        category: row[0],
+        limit: Number(row[1]),
+        spent: Number((totals[row[0]] || 0).toFixed(2)),
+        remaining: Number((Number(row[1]) - (totals[row[0]] || 0)).toFixed(2))
+    }));
+}
+
+async function getCategoryLimitAlert(category, spreadsheetId) {
+    const statuses = await getCategoryLimitStatuses(spreadsheetId);
+    if (statuses.error) return null;
+    const status = statuses.find(item => item.category === category);
+    if (!status) return null;
+    const percentage = status.spent / status.limit;
+    if (percentage < 0.8) return null;
+    return percentage >= 1
+        ? `${status.category} is over its monthly limit by ₹${Math.abs(status.remaining).toFixed(2)}.`
+        : `${status.category} has used ${Math.round(percentage * 100)}% of its monthly limit.`;
+}
+
+async function getMonthlyReport(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return { error: 'Google Sheets is not configured.' };
+    const month = getMonthSheetName();
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${month}!A:K` }).catch(() => null);
+    const rows = response?.data?.values || [];
+    if (rows.length <= 1) return { month, total: 0, count: 0, categories: [], budget: null, owed: 0 };
+
+    const categories = {};
+    let total = 0;
+    for (const row of rows.slice(1)) {
+        const amount = Number(row[1]);
+        if (!Number.isFinite(amount)) continue;
+        total += amount;
+        const category = row[2] || 'Uncategorized';
+        categories[category] = (categories[category] || 0) + amount;
+    }
+    const budget = await getBudgetStatus(spreadsheetId);
+    const owed = await getOwedSummary(spreadsheetId);
+    return {
+        month,
+        total: Number(total.toFixed(2)),
+        count: rows.length - 1,
+        categories: Object.entries(categories)
+            .map(([category, amount]) => ({ category, amount: Number(amount.toFixed(2)) }))
+            .sort((first, second) => second.amount - first.amount),
+        budget: budget.error ? null : budget,
+        owed: owed.error ? 0 : owed.total
+    };
+}
+
+async function recordSettlement(name, amount, reason, spreadsheetId) {
+    if (!sheets || !spreadsheetId) return { error: 'Google Sheets is not configured.' };
+    const personName = String(name || '').trim();
+    const settledAmount = Number(amount);
+    if (!personName || !Number.isFinite(settledAmount) || settledAmount <= 0) {
+        return { error: 'Use /paid Name Amount, for example /paid Yash 500.' };
+    }
+    await ensureOwedSheetExists(spreadsheetId);
+    const date = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const addedAt = new Date().toISOString();
+    const transactionId = crypto.randomUUID();
+    const existingRowsResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Owed!A:A' });
+    const firstDataRow = (existingRowsResponse.data.values || []).length + 1;
+    await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'Owed!A:I',
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [[
+                date,
+                personName,
+                -Number(settledAmount.toFixed(2)),
+                0,
+                'Settlement',
+                addedAt,
+                `=SUMIF($B$2:$B,B${firstDataRow},$C$2:$C)`,
+                reason || 'Repayment received',
+                transactionId
+            ]]
+        }
+    });
+    return { name: personName, amount: settledAmount };
+}
+
+async function getOwedSummary(spreadsheetId, personFilter = null) {
+    if (!sheets || !spreadsheetId) {
+        return { error: 'Google Sheets is not configured.' };
+    }
+
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: 'Owed!A:H'
+    }).catch(() => null);
+    const rows = response?.data?.values || [];
+    if (rows.length <= 1) {
+        return { total: 0, people: [] };
+    }
+
+    const peopleByKey = new Map();
+    for (const row of rows.slice(1)) {
+        const name = String(row[1] || '').trim();
+        const amount = Number(row[2]);
+        if (!name || !Number.isFinite(amount) || (personFilter && name.toLowerCase() !== personFilter.toLowerCase())) continue;
+
+        const key = name.toLowerCase();
+        let person = peopleByKey.get(key);
+        if (!person) {
+            person = { name, total: 0, transactions: [] };
+            peopleByKey.set(key, person);
+        }
+        person.total = Number((person.total + amount).toFixed(2));
+        if (amount > 0) {
+            person.transactions.push({
+                date: row[0] || 'Unknown date',
+                amount,
+                reason: row[7] || row[4] || 'No reason recorded'
+            });
+        }
+    }
+
+    const people = [...peopleByKey.values()]
+        .filter(person => person.total > 0)
+        .sort((first, second) => second.total - first.total);
+    return {
+        total: Number(people.reduce((sum, person) => sum + person.total, 0).toFixed(2)),
+        people
+    };
 }
 
 async function getAveragePerDayThisMonth(spreadsheetId) {
@@ -512,20 +1141,46 @@ async function undoLastExpense(spreadsheetId) {
             deletedAmount = rows[maxRowIndex][1];
         }
 
+        const transactionId = rows[maxRowIndex][10];
+        const requests = [{
+            deleteDimension: {
+                range: {
+                    sheetId: sheetId,
+                    dimension: "ROWS",
+                    startIndex: maxRowIndex,
+                    endIndex: maxRowIndex + 1
+                }
+            }
+        }];
+
+        if (transactionId) {
+            const owedSheet = spreadsheetInfo.data.sheets.find(item => item.properties.title === 'Owed');
+            if (owedSheet) {
+                const owedResponse = await sheets.spreadsheets.values.get({
+                    spreadsheetId: spreadsheetId,
+                    range: 'Owed!A:I'
+                });
+                const owedRows = owedResponse.data.values || [];
+                for (let index = owedRows.length - 1; index >= 1; index--) {
+                    if (owedRows[index][8] === transactionId) {
+                        requests.push({
+                            deleteDimension: {
+                                range: {
+                                    sheetId: owedSheet.properties.sheetId,
+                                    dimension: 'ROWS',
+                                    startIndex: index,
+                                    endIndex: index + 1
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
         await sheets.spreadsheets.batchUpdate({
             spreadsheetId: spreadsheetId,
-            requestBody: {
-                requests: [{
-                    deleteDimension: {
-                        range: {
-                            sheetId: sheetId,
-                            dimension: "ROWS",
-                            startIndex: maxRowIndex,
-                            endIndex: maxRowIndex + 1
-                        }
-                    }
-                }]
-            }
+            requestBody: { requests }
         });
         return deletedAmount;
     } catch (e) {
@@ -536,8 +1191,19 @@ async function undoLastExpense(spreadsheetId) {
 
 module.exports = {
     processExpenseMessage,
+    processReceiptImage,
+    parseSplitExpenseMessage,
+    completePendingSplit,
     getTodayTotal,
     getMonthTotal,
+    setMonthlyBudget,
+    getBudgetStatus,
+    setCategoryLimit,
+    getCategoryLimitStatuses,
+    getCategoryLimitAlert,
+    getMonthlyReport,
+    getOwedSummary,
+    recordSettlement,
     getAveragePerDayThisMonth,
     getCategoryOverviewThisMonth,
     undoLastExpense,
