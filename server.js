@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, getOwedSummary, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
+const { processExpenseMessage, completePendingSplit, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, getOwedSummary, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
@@ -12,6 +12,8 @@ app.use(express.json());
 
 // Idempotency cache: store recently processed update IDs
 const processedUpdates = new Set();
+const pendingSplitClarifications = new Map();
+const PENDING_SPLIT_TTL_MS = 10 * 60 * 1000;
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -155,6 +157,11 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
 
         console.log(`Processing Telegram Command: "${text}" from ${username}`);
 
+        const pendingSplit = pendingSplitClarifications.get(String(chatId));
+        if (pendingSplit && Date.now() - pendingSplit.createdAt > PENDING_SPLIT_TTL_MS) {
+            pendingSplitClarifications.delete(String(chatId));
+        }
+
         if (text === '/today') {
             const total = await getTodayTotal(spreadsheetId);
             await sendTelegramReply(chatId, `Today's Total Expenses: ₹${total.toFixed(2)}`);
@@ -242,12 +249,30 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/start') {
-            await sendTelegramReply(chatId, `Good to see you, ${username}. I am ready to keep your finances in order.\n\nTry: "150 auto rickshaw"\n\nCommands:\n/today - today's total\n/month - this month's total\n/budget 30000 - set a monthly budget\n/budget - review budget status\n/avg - daily average and projection\n/overview - category breakdown\n/last - most recent transaction\n/undo - remove the last expense`);
+            await sendTelegramReply(chatId, `Good to see you, ${username}. I am ready to keep your finances in order.\n\nTry: "150 auto rickshaw"\n\nCommands:\n/today - today's total\n/month - this month's total\n/budget 30000 - set a monthly budget\n/budget - review budget status\n/avg - daily average and projection\n/overview - category breakdown\n/last - most recent transaction\n/undo - remove the last expense\n/owed - amounts owed to you`);
         }
         else {
-            const aiResult = await processExpenseMessage(text, spreadsheetId);
+            let aiResult;
+            const activePendingSplit = pendingSplitClarifications.get(String(chatId));
+            if (activePendingSplit) {
+                const completedSplit = completePendingSplit(activePendingSplit, text);
+                if (completedSplit.error) {
+                    await sendTelegramReply(chatId, completedSplit.error);
+                    return res.status(200).send('Telegram webhook processed');
+                }
+                pendingSplitClarifications.delete(String(chatId));
+                aiResult = await processExpenseMessage(text, spreadsheetId, completedSplit);
+            } else {
+                aiResult = await processExpenseMessage(text, spreadsheetId);
+            }
             if (aiResult.error) {
                 // LLM or Service error
+                if (aiResult.pending) {
+                    pendingSplitClarifications.set(String(chatId), {
+                        ...aiResult.pending,
+                        createdAt: Date.now()
+                    });
+                }
                 await sendTelegramReply(chatId, `I could not complete that request: ${aiResult.error}`);
             } else if (aiResult.type === 'log') {
                 const expenseData = aiResult.data;

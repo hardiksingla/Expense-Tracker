@@ -205,14 +205,29 @@ async function ensureBudgetSheetExists(spreadsheetId) {
 
 function parseSplitExpenseMessage(message) {
     const text = message.trim();
-    const amountMatch = text.match(/^(\d+(?:\.\d+)?)(?:\s+|\s*\()/);
+    const amountMatch = text.match(/^(\d+(?:\.\d+)?)(.*)$/);
     if (!amountMatch) return null;
 
     const originalAmount = Number(amountMatch[1]);
-    const reasonMatch = text.match(/\(([^)]+)\)/);
+    const body = amountMatch[2].trim();
+    const reasonMatch = body.match(/^\(([^)]+)\)/);
     const reason = reasonMatch?.[1]?.trim() || 'Split expense';
+    const splitInstruction = body.replace(/^\([^)]*\)\s*/, '').replace(/^[-:]\s*/, '').trim();
 
-    const equalMatch = text.match(/^\s*\d+(?:\.\d+)?(?:\s*\([^)]*\))?\s+split\s+equally\s+between\s+(.+)$/i);
+    if (/\brest\s+(?:is\s+)?(?:divide|divided)\s+by\s+\d+/i.test(splitInstruction)) {
+        const remainderMatch = splitInstruction.match(/^(\d+(?:\.\d+)?)\s+(?:me|myself|i)\s*,\s*rest\s+(?:is\s+)?(?:divide|divided)\s+by\s+(\d+)/i);
+        return {
+            error: 'Please reply with the names of the people included in the remaining split, separated by commas.',
+            pending: remainderMatch ? {
+                originalAmount,
+                personalAmount: Number(remainderMatch[1]),
+                peopleCount: Number(remainderMatch[2]),
+                reason
+            } : null
+        };
+    }
+
+    const equalMatch = splitInstruction.match(/^split\s+equally\s+between\s+(.+)$/i);
     if (equalMatch) {
         const people = equalMatch[1]
             .replace(/\s+and\s+/gi, ',')
@@ -231,10 +246,9 @@ function parseSplitExpenseMessage(message) {
         };
     }
 
-    const explicitMatch = text.match(/^\s*\d+(?:\.\d+)?(?:\s*\([^)]*\))?\s*-\s*(.+)$/);
-    if (!explicitMatch) return null;
+    if (!splitInstruction) return null;
 
-    const owedEntries = explicitMatch[1].split(',').map(entry => {
+    const owedEntries = splitInstruction.split(',').map(entry => {
         const entryMatch = entry.match(/^\s*(\d+(?:\.\d+)?)\s+(.+?)\s*$/);
         if (!entryMatch) return null;
         return { amount: Number(entryMatch[1]), name: entryMatch[2].trim() };
@@ -251,6 +265,41 @@ function parseSplitExpenseMessage(message) {
         originalAmount,
         owedEntries,
         reason: reasonMatch?.[1]?.trim() || 'Split expense'
+    };
+}
+
+function completePendingSplit(pending, namesMessage) {
+    const names = namesMessage
+        .replace(/^names?\s*(?:are|:)?\s*/i, '')
+        .replace(/\s+and\s+/gi, ',')
+        .split(',')
+        .map(name => name.trim())
+        .filter(Boolean);
+
+    if (names.length !== pending.peopleCount) {
+        return { error: `Please provide exactly ${pending.peopleCount} names, separated by commas.` };
+    }
+    if (names.some(name => /^(me|myself|i)$/i.test(name))) {
+        return { error: 'Please provide the names of the other people. Your personal share is already recorded.' };
+    }
+
+    const remainder = Number((pending.originalAmount - pending.personalAmount).toFixed(2));
+    if (remainder < 0 || pending.personalAmount < 0) {
+        return { error: 'The personal share cannot be greater than the total transaction amount.' };
+    }
+
+    const baseShare = Number((remainder / pending.peopleCount).toFixed(2));
+    const owedEntries = names.map((name, index) => ({
+        name,
+        amount: index === names.length - 1
+            ? Number((remainder - baseShare * (names.length - 1)).toFixed(2))
+            : baseShare
+    }));
+    return {
+        amount: pending.personalAmount,
+        originalAmount: pending.originalAmount,
+        owedEntries,
+        reason: pending.reason
     };
 }
 
@@ -282,8 +331,11 @@ async function appendOwedEntries(splitData, date, addedAtTime, spreadsheetId) {
     });
 }
 
-async function processExpenseMessage(message, spreadsheetId) {
-    const splitData = parseSplitExpenseMessage(message);
+async function processExpenseMessage(message, spreadsheetId, splitOverride = null) {
+    const splitData = splitOverride || parseSplitExpenseMessage(message);
+    if (splitData?.error) {
+        return { error: splitData.error, pending: splitData.pending };
+    }
     if (splitData) {
         const d = new Date();
         const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -848,6 +900,7 @@ async function undoLastExpense(spreadsheetId) {
 module.exports = {
     processExpenseMessage,
     parseSplitExpenseMessage,
+    completePendingSplit,
     getTodayTotal,
     getMonthTotal,
     setMonthlyBudget,
