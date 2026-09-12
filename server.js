@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, completePendingSplit, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, getOwedSummary, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
+const { processExpenseMessage, processReceiptImage, completePendingSplit, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, setCategoryLimit, getCategoryLimitStatuses, getCategoryLimitAlert, getMonthlyReport, getOwedSummary, recordSettlement, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
@@ -65,6 +65,13 @@ async function callTelegramApi(method, body = {}) {
         throw new Error(result.description || `Telegram API request failed with status ${response.status}`);
     }
     return result.result;
+}
+
+async function downloadTelegramPhoto(photo) {
+    const file = await callTelegramApi('getFile', { file_id: photo.file_id });
+    const response = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`);
+    if (!response.ok) throw new Error(`Telegram image download failed with status ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
 }
 
 app.get('/telegram/webhook-info', authorizeWebhookAdmin, async (req, res) => {
@@ -151,6 +158,23 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
         const text = msgObj.text;
         const chatId = msgObj.chat?.id;
 
+        if (msgObj.photo?.length) {
+            try {
+                const photo = msgObj.photo[msgObj.photo.length - 1];
+                const imageBuffer = await downloadTelegramPhoto(photo);
+                const result = await processReceiptImage(imageBuffer, 'image/jpeg', msgObj.caption, spreadsheetId);
+                if (result.error) {
+                    await sendTelegramReply(chatId, result.error);
+                } else {
+                    await sendTelegramReply(chatId, `Receipt recorded: ₹${result.data.amount} for ${result.data.category}.`);
+                }
+            } catch (error) {
+                console.error('Receipt webhook failed:', error.message);
+                await sendTelegramReply(chatId, 'I could not process that receipt image. Please try a clearer image.');
+            }
+            return res.status(200).send('Telegram webhook processed');
+        }
+
         if (!text) {
             return res.status(200).send('Ignored: No text');
         }
@@ -169,6 +193,39 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
         else if (text === '/month') {
             const total = await getMonthTotal(spreadsheetId);
             await sendTelegramReply(chatId, `This Month's Total Expenses: ₹${total.toFixed(2)}`);
+        }
+        else if (text.startsWith('/limit ')) {
+            const parts = text.slice('/limit'.length).trim().match(/^(.+?)\s+(\d+(?:\.\d+)?)$/);
+            if (!parts) {
+                await sendTelegramReply(chatId, 'Use /limit Category Amount, for example /limit Food & Dining 8000.');
+            } else {
+                const result = await setCategoryLimit(parts[1], parts[2], spreadsheetId);
+                await sendTelegramReply(chatId, result.error || `Monthly limit set for ${result.category}: ₹${result.limit.toFixed(2)}.`);
+            }
+        }
+        else if (text === '/limits') {
+            const statuses = await getCategoryLimitStatuses(spreadsheetId);
+            if (statuses.error) {
+                await sendTelegramReply(chatId, statuses.error);
+            } else if (!statuses.length) {
+                await sendTelegramReply(chatId, 'No category limits are set.');
+            } else {
+                await sendTelegramReply(chatId, statuses.map(status => `${status.category}: ₹${status.spent.toFixed(2)} of ₹${status.limit.toFixed(2)} (₹${status.remaining.toFixed(2)} remaining)`).join('\n'));
+            }
+        }
+        else if (text === '/report') {
+            const report = await getMonthlyReport(spreadsheetId);
+            if (report.error) {
+                await sendTelegramReply(chatId, report.error);
+            } else {
+                const categoryText = report.categories.length
+                    ? report.categories.slice(0, 3).map(item => `${item.category}: ₹${item.amount.toFixed(2)}`).join('\n')
+                    : 'No spending recorded.';
+                const budgetText = report.budget?.budget !== null && report.budget
+                    ? `\nBudget: ₹${report.budget.budget.toFixed(2)}\nRemaining: ₹${report.budget.remaining.toFixed(2)}`
+                    : '\nBudget: not set';
+                await sendTelegramReply(chatId, `Monthly report for ${report.month}\n\nSpent: ₹${report.total.toFixed(2)} across ${report.count} transactions.${budgetText}\nOutstanding owed: ₹${report.owed.toFixed(2)}\n\nTop categories:\n${categoryText}`);
+            }
         }
         else if (text === '/budget' || text.startsWith('/budget ')) {
             const budgetInput = text.slice('/budget'.length).trim();
@@ -206,6 +263,30 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                     return `${person.name}: ₹${person.total.toFixed(2)}\n  ${recentReasons}`;
                 });
                 await sendTelegramReply(chatId, `Outstanding amounts: ₹${summary.total.toFixed(2)}\n\n${lines.join('\n\n')}`);
+            }
+        }
+        else if (text.startsWith('/owed ')) {
+            const person = text.slice('/owed'.length).trim();
+            const summary = await getOwedSummary(spreadsheetId, person);
+            if (summary.error) {
+                await sendTelegramReply(chatId, summary.error);
+            } else if (summary.people.length === 0) {
+                await sendTelegramReply(chatId, `No outstanding amount found for ${person}.`);
+            } else {
+                const personData = summary.people[0];
+                const details = personData.transactions.slice(-10)
+                    .map(transaction => `${transaction.date}: ₹${transaction.amount.toFixed(2)} for ${transaction.reason}`)
+                    .join('\n');
+                await sendTelegramReply(chatId, `${personData.name} owes ₹${personData.total.toFixed(2)}.\n\n${details}`);
+            }
+        }
+        else if (text.startsWith('/paid ')) {
+            const parts = text.slice('/paid'.length).trim().match(/^(.+?)\s+(\d+(?:\.\d+)?)(?:\s+(.+))?$/);
+            if (!parts) {
+                await sendTelegramReply(chatId, 'Use /paid Name Amount, for example /paid Yash 500.');
+            } else {
+                const settlement = await recordSettlement(parts[1], parts[2], parts[3], spreadsheetId);
+                await sendTelegramReply(chatId, settlement.error || `Recorded ₹${settlement.amount.toFixed(2)} repayment from ${settlement.name}.`);
             }
         }
         else if (text === '/avg') {
@@ -249,7 +330,7 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/start') {
-            await sendTelegramReply(chatId, `Good to see you, ${username}. I am ready to keep your finances in order.\n\nTry: "150 auto rickshaw"\n\nCommands:\n/today - today's total\n/month - this month's total\n/budget 30000 - set a monthly budget\n/budget - review budget status\n/avg - daily average and projection\n/overview - category breakdown\n/last - most recent transaction\n/undo - remove the last expense\n/owed - amounts owed to you`);
+            await sendTelegramReply(chatId, `Good to see you, ${username}. I am ready to keep your finances in order.\n\nTry: "150 auto rickshaw" or send a receipt photo.\n\nCommands:\n/today - today's total\n/month - this month's total\n/budget 30000 - set a monthly budget\n/budget - review budget status\n/limit Food & Dining 8000 - set a category limit\n/limits - review category limits\n/report - monthly financial report\n/owed - amounts owed to you\n/owed Yash - one person's balance\n/paid Yash 500 - record a repayment\n/avg - daily average and projection\n/overview - category breakdown\n/last - most recent transaction\n/undo - remove the last expense`);
         }
         else {
             let aiResult;
@@ -279,7 +360,8 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                 const owedMessage = aiResult.owed?.length
                     ? `\nOwed: ${aiResult.owed.map(entry => `${entry.name} ₹${entry.amount}`).join(', ')}`
                     : '';
-                await sendTelegramReply(chatId, `Recorded ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).${owedMessage}`);
+                const limitAlert = await getCategoryLimitAlert(expenseData.category, spreadsheetId);
+                await sendTelegramReply(chatId, `Recorded ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).${owedMessage}${limitAlert ? `\n${limitAlert}` : ''}`);
             } else if (aiResult.type === 'query' || aiResult.type === 'chat') {
                 await sendTelegramReply(chatId, aiResult.text);
             }

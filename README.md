@@ -164,6 +164,15 @@ The assistant also understands equal splits and reasons:
 
 The first records your share as `₹153` and adds `₹153` owed by Yash. The second records your share as `₹290`, adds `₹450` owed by Yash, and saves `Aata purchase` as the reason.
 
+Repayments can be recorded with:
+
+```text
+/paid Yash 500
+/paid Yash 500 dinner repayment
+```
+
+Repayments reduce the person's outstanding balance while preserving the original owed history. Telegram receipt photos are also supported; send a clear receipt image, optionally with a caption such as `office lunch`, and the assistant will extract the expense details.
+
 ## Telegram Commands
 
 ```text
@@ -171,7 +180,12 @@ The first records your share as `₹153` and adds `₹153` owed by Yash. The sec
 /month       Current month's total
 /budget 30000 Set or update the current monthly budget
 /budget      Review budget, spending, remaining amount, and pace
+/limit Category Amount Set a monthly category limit
+/limits      Review category spending limits
+/report      Monthly report with budget and owed summary
 /owed        Review amounts owed to you by person and reason
+/owed Name   Review one person's outstanding balance
+/paid Name Amount Record a repayment
 /avg         Average daily spending this month
 /overview    Category breakdown
 /last        Most recent expense
@@ -187,6 +201,13 @@ The first records your share as `₹153` and adds `₹153` owed by Yash. The sec
 | `POST` | `/webhook` | Receives WhatsApp-style webhook payloads |
 | `GET` | `/telegram/webhook-info?adminToken=...` | Reads Telegram webhook status |
 | `GET` | `/telegram/set-webhook?adminToken=...` | Registers or updates Telegram's webhook |
+
+The application uses these sheets:
+
+- `Budget` for monthly budgets.
+- `Limits` for category limits.
+- `Owed` for owed entries, repayments, reasons, and transaction IDs.
+- Monthly sheets for expenses and transaction IDs used by `/undo`.
 
 ## Forking and Personal Setup
 
