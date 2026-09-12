@@ -130,7 +130,144 @@ async function ensureMonthlySheetExists(sheetName, spreadsheetId) {
     }
 }
 
+async function ensureOwedSheetExists(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return;
+
+    const sheetName = 'Owed';
+    try {
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName);
+
+        if (!sheetExists) {
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId,
+                requestBody: {
+                    requests: [{ addSheet: { properties: { title: sheetName } } }]
+                }
+            });
+
+            const headers = [[
+                'Date', 'Name', 'Amount Owed', 'Expense Amount', 'Description', 'AddedAt', 'Total Owed By Person', 'Reason / Note'
+            ]];
+            await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${sheetName}!A1:G1`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: headers }
+            });
+        } else {
+            const headerResponse = await sheets.spreadsheets.values.get({
+                spreadsheetId,
+                range: `${sheetName}!A1:H1`
+            });
+            const headers = headerResponse.data.values?.[0] || [];
+            if (headers[7] !== 'Reason / Note') {
+                await sheets.spreadsheets.values.update({
+                    spreadsheetId,
+                    range: `${sheetName}!H1`,
+                    valueInputOption: 'RAW',
+                    requestBody: { values: [['Reason / Note']] }
+                });
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error checking/creating Owed sheet:', error.message);
+    }
+}
+
+function parseSplitExpenseMessage(message) {
+    const match = message.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(.+)$/);
+    if (!match) return null;
+
+    const owedEntries = match[2].split(',').map(entry => {
+        const entryMatch = entry.match(/^\s*-?\s*(\d+(?:\.\d+)?)\s+(.+?)\s*$/);
+        if (!entryMatch) return null;
+        return { amount: Number(entryMatch[1]), name: entryMatch[2].trim() };
+    });
+
+    if (owedEntries.some(entry => !entry) || owedEntries.length === 0) return null;
+
+    const totalOwed = owedEntries.reduce((total, entry) => total + entry.amount, 0);
+    return {
+        amount: Number(match[1]) - totalOwed,
+        originalAmount: Number(match[1]),
+        owedEntries
+    };
+}
+
+async function appendOwedEntries(splitData, date, addedAtTime, reason, spreadsheetId) {
+    if (!sheets || !spreadsheetId) return;
+
+    await ensureOwedSheetExists(spreadsheetId);
+    const existingRowsResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: 'Owed!A:A'
+    });
+    const firstDataRow = (existingRowsResponse.data.values || []).length + 1;
+    const values = splitData.owedEntries.map((entry, index) => [
+        date,
+        entry.name,
+        entry.amount,
+        splitData.originalAmount,
+        `Split expense of ₹${splitData.originalAmount}`,
+        addedAtTime,
+        `=SUMIF($B$2:$B,B${firstDataRow + index},$C$2:$C)`,
+        reason
+    ]);
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'Owed!A:H',
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values }
+    });
+}
+
 async function processExpenseMessage(message, spreadsheetId) {
+    const splitData = parseSplitExpenseMessage(message);
+    if (splitData) {
+        const d = new Date();
+        const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
+        const addedAtTime = `${datePart} ${timePart}`;
+        const expenseData = {
+            is_error: false,
+            amount: splitData.amount,
+            category: 'Miscellaneous',
+            subcategory: 'Split expense',
+            description: `Paid ₹${splitData.originalAmount}; ${splitData.owedEntries.map(entry => `${entry.name} owes ₹${entry.amount}`).join(', ')}`,
+            merchant: 'Split expense',
+            payment_method: 'UPI',
+            need_want: 'Need',
+            date: datePart
+        };
+
+        if (sheets && spreadsheetId) {
+            const sheetName = getMonthSheetName(expenseData.date);
+            await ensureMonthlySheetExists(sheetName, spreadsheetId);
+            await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${sheetName}!A:J`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: [[
+                    expenseData.date,
+                    expenseData.amount,
+                    expenseData.category,
+                    expenseData.subcategory,
+                    expenseData.merchant,
+                    expenseData.description,
+                    expenseData.payment_method,
+                    expenseData.need_want,
+                    addedAtTime,
+                    '=SUM($B$2:INDIRECT("B"&ROW()))'
+                ]] }
+            });
+            await appendOwedEntries(splitData, datePart, addedAtTime, message.trim(), spreadsheetId);
+        }
+
+        return { type: 'log', data: expenseData, owed: splitData.owedEntries };
+    }
+
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
     const prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
 
@@ -536,6 +673,7 @@ async function undoLastExpense(spreadsheetId) {
 
 module.exports = {
     processExpenseMessage,
+    parseSplitExpenseMessage,
     getTodayTotal,
     getMonthTotal,
     getAveragePerDayThisMonth,

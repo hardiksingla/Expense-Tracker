@@ -6,6 +6,7 @@ const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware'
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBHOOK_ADMIN_TOKEN = process.env.WEBHOOK_ADMIN_TOKEN;
 
 app.use(express.json());
 
@@ -21,16 +22,79 @@ async function sendTelegramReply(chatId, text) {
         console.error("Missing TELEGRAM_BOT_TOKEN to send replies");
         return;
     }
+    const cleanText = String(text ?? '')
+        .replace(/\*\*/g, '')
+        .replace(/__/g, '');
     try {
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: text })
+            body: JSON.stringify({ chat_id: chatId, text: cleanText })
         });
     } catch (e) {
         console.error("Failed to send telegram message:", e);
     }
 }
+
+function authorizeWebhookAdmin(req, res, next) {
+    if (!WEBHOOK_ADMIN_TOKEN || req.query.adminToken !== WEBHOOK_ADMIN_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+
+async function callTelegramApi(method, body = {}) {
+    if (!TELEGRAM_BOT_TOKEN) {
+        throw new Error('TELEGRAM_BOT_TOKEN is missing');
+    }
+
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    const result = await response.json();
+
+    if (!response.ok || !result.ok) {
+        throw new Error(result.description || `Telegram API request failed with status ${response.status}`);
+    }
+    return result.result;
+}
+
+app.get('/telegram/webhook-info', authorizeWebhookAdmin, async (req, res) => {
+    try {
+        const info = await callTelegramApi('getWebhookInfo');
+        res.json({
+            url: info.url,
+            hasCustomCertificate: info.has_custom_certificate,
+            pendingUpdateCount: info.pending_update_count,
+            lastErrorDate: info.last_error_date,
+            lastErrorMessage: info.last_error_message
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/telegram/set-webhook', authorizeWebhookAdmin, async (req, res) => {
+    const webhookUrl = req.query.url || `${process.env.PUBLIC_BASE_URL || ''}/telegram/webhook`;
+
+    if (!webhookUrl.startsWith('https://')) {
+        return res.status(400).json({ error: 'A public HTTPS webhook URL is required.' });
+    }
+
+    try {
+        const result = await callTelegramApi('setWebhook', {
+            url: webhookUrl,
+            ...(process.env.TELEGRAM_WEBHOOK_SECRET
+                ? { secret_token: process.env.TELEGRAM_WEBHOOK_SECRET }
+                : {})
+        });
+        res.json({ ok: result, webhookUrl });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // WhatsApp Webhook endpoint
 app.post('/webhook', async (req, res) => {
@@ -144,7 +208,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                 await sendTelegramReply(chatId, `⚠️ Oops! ${aiResult.error}`);
             } else if (aiResult.type === 'log') {
                 const expenseData = aiResult.data;
-                await sendTelegramReply(chatId, `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).`);
+                const owedMessage = aiResult.owed?.length
+                    ? `\nOwed: ${aiResult.owed.map(entry => `${entry.name} ₹${entry.amount}`).join(', ')}`
+                    : '';
+                await sendTelegramReply(chatId, `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).${owedMessage}`);
             } else if (aiResult.type === 'query' || aiResult.type === 'chat') {
                 await sendTelegramReply(chatId, aiResult.text);
             }
