@@ -155,11 +155,23 @@ A split expense is written as:
 
 This records `231` as the expense and adds separate rows for Vaibhav and Yash in the `Owed` sheet. The owed rows include the date, person's name, amount, original expense amount, timestamp, running total, and the original message as `Reason / Note`.
 
+The assistant also understands equal splits and reasons:
+
+```text
+306 split equally between me and Yash
+740 (Aata purchase) - 450 Yash
+```
+
+The first records your share as `₹153` and adds `₹153` owed by Yash. The second records your share as `₹290`, adds `₹450` owed by Yash, and saves `Aata purchase` as the reason.
+
 ## Telegram Commands
 
 ```text
 /today       Today's total
 /month       Current month's total
+/budget 30000 Set or update the current monthly budget
+/budget      Review budget, spending, remaining amount, and pace
+/owed        Review amounts owed to you by person and reason
 /avg         Average daily spending this month
 /overview    Category breakdown
 /last        Most recent expense

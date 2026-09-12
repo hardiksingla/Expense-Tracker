@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
+const { processExpenseMessage, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, getOwedSummary, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
@@ -24,7 +24,11 @@ async function sendTelegramReply(chatId, text) {
     }
     const cleanText = String(text ?? '')
         .replace(/\*\*/g, '')
-        .replace(/__/g, '');
+        .replace(/__/g, '')
+        .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\n /g, '\n')
+        .trim();
     try {
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -159,13 +163,51 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             const total = await getMonthTotal(spreadsheetId);
             await sendTelegramReply(chatId, `This Month's Total Expenses: ₹${total.toFixed(2)}`);
         }
+        else if (text === '/budget' || text.startsWith('/budget ')) {
+            const budgetInput = text.slice('/budget'.length).trim();
+            if (budgetInput) {
+                const result = await setMonthlyBudget(budgetInput, spreadsheetId);
+                await sendTelegramReply(chatId, result.error
+                    ? result.error
+                    : `Monthly budget set to ₹${result.budget.toFixed(2)} for ${result.month}.`);
+            } else {
+                const status = await getBudgetStatus(spreadsheetId);
+                if (status.error) {
+                    await sendTelegramReply(chatId, status.error);
+                } else if (status.budget === null) {
+                    await sendTelegramReply(chatId, `No budget is set for ${status.month}. Use /budget amount, for example /budget 30000.`);
+                } else {
+                    const pace = status.spent > status.expectedSpend
+                        ? 'You are spending faster than the calendar pace.'
+                        : 'Your spending is within the calendar pace.';
+                    await sendTelegramReply(chatId, `Budget for ${status.month}: ₹${status.budget.toFixed(2)}\nSpent: ₹${status.spent.toFixed(2)}\nRemaining: ₹${status.remaining.toFixed(2)}\n${pace}`);
+                }
+            }
+        }
+        else if (text === '/owed') {
+            const summary = await getOwedSummary(spreadsheetId);
+            if (summary.error) {
+                await sendTelegramReply(chatId, summary.error);
+            } else if (summary.people.length === 0) {
+                await sendTelegramReply(chatId, 'There are no recorded outstanding amounts yet.');
+            } else {
+                const lines = summary.people.map(person => {
+                    const recentReasons = person.transactions
+                        .slice(-3)
+                        .map(transaction => `${transaction.date}: ₹${transaction.amount.toFixed(2)} for ${transaction.reason}`)
+                        .join('\n  ');
+                    return `${person.name}: ₹${person.total.toFixed(2)}\n  ${recentReasons}`;
+                });
+                await sendTelegramReply(chatId, `Outstanding amounts: ₹${summary.total.toFixed(2)}\n\n${lines.join('\n\n')}`);
+            }
+        }
         else if (text === '/avg') {
             const stats = await getAveragePerDayThisMonth(spreadsheetId);
             if (!stats) {
-                await sendTelegramReply(chatId, "⚠️ Could not fetch average. Ensure Google Sheets is configured.");
+                await sendTelegramReply(chatId, "Could not fetch the average. Please ensure Google Sheets is configured.");
             } else {
                 const projected = stats.average * 30;
-                const msg = `Your total expenses for this month (${stats.monthName} 1 to ${stats.monthName} ${stats.daysPast}, ${stats.year}) are **₹${stats.total.toFixed(2)}** across ${stats.transactionCount} transactions.\n\nOver the ${stats.daysPast} days so far, your average daily expense is **₹${stats.average.toFixed(2)} per day**.\n\nProjected Monthly Total: **₹${projected.toFixed(2)}**`;
+                const msg = `Here is your monthly summary, ${username}.\n\nSpent: ₹${stats.total.toFixed(2)} across ${stats.transactionCount} transactions.\nDaily average: ₹${stats.average.toFixed(2)} over ${stats.daysPast} days.\nProjected month-end total: ₹${projected.toFixed(2)}.`;
                 await sendTelegramReply(chatId, msg);
             }
         }
@@ -175,44 +217,44 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             const overviewStr = await getCategoryOverviewThisMonth(spreadsheetId, targetMonth);
             if (overviewStr) {
                 if (overviewStr.error) {
-                    await sendTelegramReply(chatId, `⚠️ ${overviewStr.error}`);
+                    await sendTelegramReply(chatId, overviewStr.error);
                 } else {
                     await sendTelegramReply(chatId, overviewStr);
                 }
             } else {
-                await sendTelegramReply(chatId, "⚠️ Could not fetch overview. Ensure Google Sheets is configured.");
+                await sendTelegramReply(chatId, "I could not fetch the overview. Please ensure Google Sheets is configured.");
             }
         }
         else if (text === '/undo') {
             const deletedAmount = await undoLastExpense(spreadsheetId);
             if (deletedAmount !== null) {
-                await sendTelegramReply(chatId, `↩️ Undid the last recorded expense of ₹${deletedAmount}.`);
+                await sendTelegramReply(chatId, `The last recorded expense of ₹${deletedAmount} has been removed.`);
             } else {
-                await sendTelegramReply(chatId, `⚠️ Could not find anything to undo.`);
+                await sendTelegramReply(chatId, `I could not find a recent expense to remove.`);
             }
         }
         else if (text === '/last') {
             const lastExp = await getLastExpense(spreadsheetId);
             if (lastExp) {
-                await sendTelegramReply(chatId, `🕒 Last Expense:\n₹${lastExp.amount} for ${lastExp.category}\nDate: ${lastExp.date}\nDescription: ${lastExp.description}\nAdded At: ${lastExp.addedAt}`);
+                await sendTelegramReply(chatId, `Most recent expense:\n₹${lastExp.amount} for ${lastExp.category}\nDate: ${lastExp.date}\nDescription: ${lastExp.description}\nAdded at: ${lastExp.addedAt}`);
             } else {
-                await sendTelegramReply(chatId, `⚠️ No recent expenses found.`);
+                await sendTelegramReply(chatId, `I could not find a recent expense.`);
             }
         }
         else if (text === '/start') {
-            await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/avg (see month's average per day)\n/overview (category breakdown)\n/last (view last transaction)\n/undo (remove last expense)`);
+            await sendTelegramReply(chatId, `Good to see you, ${username}. I am ready to keep your finances in order.\n\nTry: "150 auto rickshaw"\n\nCommands:\n/today - today's total\n/month - this month's total\n/budget 30000 - set a monthly budget\n/budget - review budget status\n/avg - daily average and projection\n/overview - category breakdown\n/last - most recent transaction\n/undo - remove the last expense`);
         }
         else {
             const aiResult = await processExpenseMessage(text, spreadsheetId);
             if (aiResult.error) {
                 // LLM or Service error
-                await sendTelegramReply(chatId, `⚠️ Oops! ${aiResult.error}`);
+                await sendTelegramReply(chatId, `I could not complete that request: ${aiResult.error}`);
             } else if (aiResult.type === 'log') {
                 const expenseData = aiResult.data;
                 const owedMessage = aiResult.owed?.length
                     ? `\nOwed: ${aiResult.owed.map(entry => `${entry.name} ₹${entry.amount}`).join(', ')}`
                     : '';
-                await sendTelegramReply(chatId, `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).${owedMessage}`);
+                await sendTelegramReply(chatId, `Recorded ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).${owedMessage}`);
             } else if (aiResult.type === 'query' || aiResult.type === 'chat') {
                 await sendTelegramReply(chatId, aiResult.text);
             }
