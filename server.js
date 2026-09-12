@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
-const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware');
+const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -77,7 +77,8 @@ app.get('/telegram/webhook-info', authorizeWebhookAdmin, async (req, res) => {
 });
 
 app.get('/telegram/set-webhook', authorizeWebhookAdmin, async (req, res) => {
-    const webhookUrl = req.query.url || `${process.env.PUBLIC_BASE_URL || ''}/telegram/webhook`;
+    const publicBaseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+    const webhookUrl = req.query.url || `${publicBaseUrl}/telegram/webhook`;
 
     if (!webhookUrl.startsWith('https://')) {
         return res.status(400).json({ error: 'A public HTTPS webhook URL is required.' });
