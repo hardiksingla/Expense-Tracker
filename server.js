@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware');
 
 const app = express();
@@ -8,6 +10,10 @@ const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(express.json());
+app.use(cors());
+app.use(express.static('public'));
+
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-demo-key';
 
 // Idempotency cache: store recently processed update IDs
 const processedUpdates = new Set();
@@ -134,6 +140,14 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                 await sendTelegramReply(chatId, `⚠️ No recent expenses found.`);
             }
         }
+        else if (text === '/dashboard') {
+            const token = jwt.sign({ spreadsheetId, username }, JWT_SECRET, { expiresIn: '7d' });
+            // Try to figure out current host
+            const host = req.get('host');
+            const protocol = req.protocol === 'https' || req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+            const magicLink = `${protocol}://${host}/?token=${token}`;
+            await sendTelegramReply(chatId, `🎨 Here is your magic link to the dashboard (valid for 7 days):\n${magicLink}`);
+        }
         else if (text === '/start') {
             await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/avg (see month's average per day)\n/overview (category breakdown)\n/last (view last transaction)\n/undo (remove last expense)`);
         }
@@ -155,6 +169,32 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
     } catch (error) {
         console.error("Error processing telegram webhook:", error);
         res.status(500).send('Internal Error');
+    }
+});
+
+// Middleware for checking JWT
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token == null) return res.sendStatus(401);
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+}
+
+// API endpoint for dashboard data
+app.get('/api/dashboard/data', authenticateToken, async (req, res) => {
+    try {
+        const { spreadsheetId } = req.user;
+        const { start, end } = req.query;
+        const data = await getAllExpenses(spreadsheetId, start, end);
+        res.json(data);
+    } catch (err) {
+        console.error("Dashboard data error:", err);
+        res.status(500).json({ error: "Failed to fetch data" });
     }
 });
 

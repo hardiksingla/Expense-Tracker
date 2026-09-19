@@ -534,6 +534,71 @@ async function undoLastExpense(spreadsheetId) {
     }
 }
 
+async function getAllExpenses(spreadsheetId, startDate = null, endDate = null) {
+    if (!sheets || !spreadsheetId) return [];
+
+    try {
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        if (!spreadsheetInfo || !spreadsheetInfo.data.sheets) return [];
+
+        let sheetTitles = spreadsheetInfo.data.sheets.map(s => s.properties.title);
+
+        if (startDate || endDate) {
+            const startStr = startDate ? startDate.slice(0, 7) : "1900-01";
+            const endStr = endDate ? endDate.slice(0, 7) : "2100-12";
+
+            sheetTitles = sheetTitles.filter(title => {
+                const tsReal = Date.parse(title);
+                if (isNaN(tsReal)) return true;
+                const d = new Date(tsReal);
+                const sheetYear = d.getFullYear();
+                const sheetMonth = String(d.getMonth() + 1).padStart(2, '0');
+                const sheetDate = `${sheetYear}-${sheetMonth}`;
+                return sheetDate >= startStr && sheetDate <= endStr;
+            });
+        }
+
+        if (sheetTitles.length === 0) return [];
+
+        const batchResponse = await sheets.spreadsheets.values.batchGet({
+            spreadsheetId,
+            ranges: sheetTitles
+        });
+
+        const expenses = [];
+        if (batchResponse.data && batchResponse.data.valueRanges) {
+            batchResponse.data.valueRanges.forEach(rangeData => {
+                const rows = rangeData.values;
+                if (!rows || rows.length <= 1) return;
+
+                for (let i = 1; i < rows.length; i++) {
+                    const dateVal = rows[i][0];
+                    if (!dateVal) continue;
+
+                    if (startDate && dateVal < startDate) continue;
+                    if (endDate && dateVal > endDate) continue;
+
+                    expenses.push({
+                        Date: dateVal,
+                        Amount: parseFloat(rows[i][1]) || 0,
+                        Category: rows[i][2] || 'Uncategorized',
+                        Subcategory: rows[i][3] || '',
+                        Merchant: rows[i][4] || '',
+                        Description: rows[i][5] || '',
+                        'Payment Method': rows[i][6] || '',
+                        'Need/Want': rows[i][7] || 'Need',
+                        AddedAt: rows[i][8] || ''
+                    });
+                }
+            });
+        }
+        return expenses;
+    } catch (e) {
+        console.error(e);
+        return [];
+    }
+}
+
 module.exports = {
     processExpenseMessage,
     getTodayTotal,
@@ -541,5 +606,6 @@ module.exports = {
     getAveragePerDayThisMonth,
     getCategoryOverviewThisMonth,
     undoLastExpense,
-    getLastExpense
+    getLastExpense,
+    getAllExpenses
 };
