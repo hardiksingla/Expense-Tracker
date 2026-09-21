@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses } = require('./expenseService');
@@ -11,7 +12,11 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(express.json());
 app.use(cors());
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-demo-key';
 
