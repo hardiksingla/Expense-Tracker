@@ -3,7 +3,9 @@ const express = require('express');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses } = require('./expenseService');
+const { connectDB, User } = require('./models');
+connectDB();
+const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses, verifySpreadsheetAccess } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware');
 
 const app = express();
@@ -89,13 +91,42 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
         const msgObj = payload?.message;
         const { username, spreadsheetId } = req;
         const text = msgObj.text;
-        const chatId = msgObj.chat?.id;
+        const chatId = req.chatId || msgObj.chat?.id;
 
         if (!text) {
             return res.status(200).send('Ignored: No text');
         }
 
         console.log(`Processing Telegram Command: "${text}" from ${username}`);
+
+        if (text === '/start') {
+            await sendTelegramReply(chatId, `Hello ${username}! Welcome to your personal expense tracker. 📊\n\nTo get started, please follow these steps:\n1. Create a new Google Sheet.\n2. Share the Google Sheet as an **Editor** with our service bot:\nsheet-bot@hazel-charter-505618-s2.iam.gserviceaccount.com\n3. Copy the URL of the Google Sheet and send it to me here.\n\nOnce done, you can start logging expenses immediately!`);
+            return res.status(200).send('Telegram webhook processed');
+        }
+
+        if (text.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)) {
+            const match = text.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+            const newSpreadsheetId = match[1];
+
+            const hasAccess = await verifySpreadsheetAccess(newSpreadsheetId);
+            if (!hasAccess) {
+                await sendTelegramReply(chatId, `⚠️ I couldn't access that Google Sheet. Please make sure you have shared it with:\nsheet-bot@hazel-charter-505618-s2.iam.gserviceaccount.com\nas an **Editor** and try sending the link again.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
+
+            await User.findOneAndUpdate(
+                { chatId },
+                { username, spreadsheetId: newSpreadsheetId },
+                { upsert: true, new: true }
+            );
+            await sendTelegramReply(chatId, `🎉 Success! I've linked your Google Sheet. You can now start logging expenses directly by typing them (e.g., "150 lunch").`);
+            return res.status(200).send('Telegram webhook processed');
+        }
+
+        if (!spreadsheetId) {
+            await sendTelegramReply(chatId, `⚠️ You haven't set up your Google Sheet yet. Type /start for instructions.`);
+            return res.status(200).send('Ignored: No spreadsheet setup');
+        }
 
         if (text === '/today') {
             const total = await getTodayTotal(spreadsheetId);
@@ -152,9 +183,6 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             const protocol = req.protocol === 'https' || req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
             const magicLink = `${protocol}://${host}/?token=${token}`;
             await sendTelegramReply(chatId, `🎨 Here is your magic link to the dashboard (valid for 7 days):\n${magicLink}`);
-        }
-        else if (text === '/start') {
-            await sendTelegramReply(chatId, `Hello ${username}! I am ready to track your expenses.\n\nSend an expense like: "150 auto rickshaw"\n\nCommands:\n/today (see today's total)\n/month (see month's total)\n/avg (see month's average per day)\n/overview (category breakdown)\n/last (view last transaction)\n/undo (remove last expense)`);
         }
         else {
             const aiResult = await processExpenseMessage(text, spreadsheetId);

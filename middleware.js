@@ -1,3 +1,5 @@
+const { User } = require('./models');
+
 const verifyTelegramWebhook = (req, res, next) => {
     const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
 
@@ -12,7 +14,7 @@ const verifyTelegramWebhook = (req, res, next) => {
     next();
 };
 
-const telegramAuthMiddleware = (req, res, next) => {
+const telegramAuthMiddleware = async (req, res, next) => {
     const payload = req.body;
     const msgObj = payload?.message;
     if (!msgObj) {
@@ -20,21 +22,43 @@ const telegramAuthMiddleware = (req, res, next) => {
     }
 
     const username = msgObj.from?.username;
-    if (!username) {
-        return res.status(200).send('Ignored: No username');
+    const chatId = msgObj.chat?.id;
+
+    if (!chatId) {
+        return res.status(200).send('Ignored: No chatId');
     }
 
-    const targetKey = `${username}_SPREADSHEET_ID`.toLowerCase();
-    const foundKey = Object.keys(process.env).find(k => k.toLowerCase() === targetKey);
-    const spreadsheetId = foundKey ? process.env[foundKey] : undefined;
+    let spreadsheetId = undefined;
 
-    if (!spreadsheetId) {
-        console.log(`Ignored message: No spreadsheet ID found for user: ${username}`);
-        return res.status(200).send('Ignored: Unauthorized');
+    // Try finding the user in DB and incrementing message count
+    try {
+        const user = await User.findOneAndUpdate(
+            { chatId },
+            {
+                $inc: { messageCount: 1 },
+                $setOnInsert: { username, createdAt: new Date() }
+            },
+            { upsert: true, new: true }
+        );
+        if (user && user.spreadsheetId) {
+            spreadsheetId = user.spreadsheetId;
+        }
+    } catch (e) {
+        console.error("DB Error finding user:", e);
+    }
+
+    // Fallback to .env for legacy users if not in DB
+    if (!spreadsheetId && username) {
+        const targetKey = `${username}_SPREADSHEET_ID`.toLowerCase();
+        const foundKey = Object.keys(process.env).find(k => k.toLowerCase() === targetKey);
+        if (foundKey) {
+            spreadsheetId = process.env[foundKey];
+        }
     }
 
     req.spreadsheetId = spreadsheetId;
-    req.username = username;
+    req.username = username || 'User';
+    req.chatId = chatId;
     next();
 };
 

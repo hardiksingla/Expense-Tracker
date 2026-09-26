@@ -599,6 +599,17 @@ async function getAllExpenses(spreadsheetId, startDate = null, endDate = null) {
     }
 }
 
+async function verifySpreadsheetAccess(spreadsheetId) {
+    if (!sheets || !spreadsheetId) return false;
+    try {
+        await sheets.spreadsheets.get({ spreadsheetId });
+        return true;
+    } catch (e) {
+        console.error("Spreadsheet access verification failed:", e.message);
+        return false;
+    }
+}
+
 module.exports = {
     processExpenseMessage,
     getTodayTotal,
@@ -607,5 +618,6 @@ module.exports = {
     getCategoryOverviewThisMonth,
     undoLastExpense,
     getLastExpense,
-    getAllExpenses
+    getAllExpenses,
+    verifySpreadsheetAccess
 };
