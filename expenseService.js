@@ -111,7 +111,7 @@ const geminiTools = [{
     functionDeclarations: [
         {
             name: "logExpense",
-            description: "Logs a new expense. Use this tool if the user provides a transaction or an expense to record. Generate dummy values if is_error is true. If the user mentions earning money (or uses a negative amount), the logged amount must be a negative number.",
+            description: "Logs a new expense or income. Automatically records to Google Sheets and sends a Telegram confirmation to the user. Use this tool if the user provides a transaction or an expense to record. Generate dummy values if is_error is true. If the user mentions earning money (or uses a negative amount), the logged amount must be a negative number.",
             parameters: {
                 type: "OBJECT",
                 properties: {
@@ -186,143 +186,208 @@ async function ensureMonthlySheetExists(sheetName, spreadsheetId) {
     }
 }
 
-async function processExpenseMessage(message, spreadsheetId) {
+async function executeLogExpense(expenseData, spreadsheetId, { chatId, sendTelegramReply } = {}) {
+    if (expenseData.is_error) {
+        console.log(`⚠️ Blocked invalid expense due to missing info: ${expenseData.error_message}`);
+        if (chatId && sendTelegramReply) {
+            await sendTelegramReply(chatId, `⚠️ ${expenseData.error_message}`);
+        }
+        return { success: false, error: expenseData.error_message };
+    }
+
+    const d = new Date();
+    const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
+    const addedAtTime = `${datePart} ${timePart}`;
+
+    console.log("🧠 Parsed Expense Data from Gemini:", JSON.stringify(expenseData, null, 2));
+
+    if (sheets && spreadsheetId) {
+        const sheetName = getMonthSheetName(expenseData.date);
+        await ensureMonthlySheetExists(sheetName, spreadsheetId);
+
+        const values = [[
+            expenseData.date,
+            expenseData.amount,
+            expenseData.category,
+            expenseData.subcategory,
+            expenseData.merchant,
+            expenseData.description,
+            expenseData.payment_method,
+            expenseData.need_want,
+            addedAtTime,
+            `=SUM($B$2:INDIRECT("B"&ROW()))`
+        ]];
+
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: spreadsheetId,
+            range: `${sheetName}!A:J`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values }
+        });
+    }
+
+    // Send Telegram message directly from tool execution
+    if (chatId && sendTelegramReply) {
+        const isIncome = expenseData.amount < 0;
+        const msg = isIncome
+            ? `💰 Added Income: ₹${Math.abs(expenseData.amount)} under ${expenseData.category}.`
+            : `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).`;
+        await sendTelegramReply(chatId, msg);
+    }
+
+    return {
+        success: true,
+        message: `Expense of ₹${expenseData.amount} for ${expenseData.category} logged successfully in Google Sheets and confirmation sent to Telegram.`
+    };
+}
+
+async function executeQueryExpenses(queryArgs, spreadsheetId) {
+    return await queryExpenses(queryArgs.startDate, queryArgs.endDate, queryArgs.category, spreadsheetId);
+}
+
+async function processExpenseMessage(message, spreadsheetId, { chatId, sendTelegramReply } = {}) {
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
+    const prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. Calling logExpense automatically records the transaction to Google Sheets and immediately sends a confirmation message to the user on Telegram. If you are ONLY logging expenses (and the user did not ask a question or request a query), do NOT generate any text response at all. You can call tools multiple times if multiple expenses are mentioned or if a query is also requested. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
 
-    console.log(`[DEBUG] Calling Gemini API...`);
+    const contents = [
+        { role: "user", parts: [{ text: prompt }] }
+    ];
 
-    let resultPayload = null;
-    let success = false;
-    let attempts = 0;
-    const MAX_RETRIES = 3;
-    const maxAttempts = MAX_RETRIES + 1; // 1 initial attempt + 3 retries
-    let lastError = null;
+    const MAX_TURNS = 5;
+    let turn = 0;
+    let executedToolsCount = 0;
+    let logCount = 0;
+    let queryCount = 0;
+    let finalModelText = null;
 
-    while (!success && attempts < maxAttempts) {
-        attempts++;
-        const apiKey = GEMINI_API_KEYS.length > 0 ? getRandomGeminiKey() : process.env.GEMINI_API_KEY;
+    while (turn < MAX_TURNS) {
+        turn++;
+        console.log(`[DEBUG] Agent Loop Turn ${turn}: Calling Gemini API...`);
 
-        if (!apiKey) {
-            console.error(`[DEBUG] ❌ No Gemini API Key found in environment variables.`);
-            return { error: `Server Configuration Error: Missing API Key.` };
-        }
+        let response = null;
+        let success = false;
+        let attempts = 0;
+        const MAX_RETRIES = 3;
+        const maxAttempts = MAX_RETRIES + 1; // 1 initial attempt + 3 retries
+        let lastError = null;
 
-        const ai = new GoogleGenAI({ apiKey: apiKey });
+        while (!success && attempts < maxAttempts) {
+            attempts++;
+            const apiKey = GEMINI_API_KEYS.length > 0 ? getRandomGeminiKey() : process.env.GEMINI_API_KEY;
 
-        try {
-            const response = await ai.models.generateContent({
-                model: 'gemini-3.6-flash',
-                contents: [{ role: "user", parts: [{ text: prompt }] }],
-                config: {
-                    tools: geminiTools
-                }
-            });
+            if (!apiKey) {
+                console.error(`[DEBUG] ❌ No Gemini API Key found in environment variables.`);
+                return { error: `Server Configuration Error: Missing API Key.` };
+            }
 
-            const functionCall = response.functionCalls?.[0];
+            const ai = new GoogleGenAI({ apiKey: apiKey });
 
-            if (functionCall) {
-                if (functionCall.name === "logExpense") {
-                    resultPayload = { type: 'log', data: functionCall.args };
-                    success = true;
-                } else if (functionCall.name === "queryExpenses") {
-                    // Execute Query
-                    const queryArgs = functionCall.args;
-                    const queryResult = await queryExpenses(queryArgs.startDate, queryArgs.endDate, queryArgs.category, spreadsheetId);
-
-                    // Call Gemini again to construct final message
-                    const followupResponse = await ai.models.generateContent({
-                        model: 'gemini-3.6-flash',
-                        contents: [
-                            { role: "user", parts: [{ text: prompt }] },
-                            response.candidates[0].content,
-                            { role: "user", parts: [{ functionResponse: { name: functionCall.name, response: queryResult } }] }
-                        ]
-                    });
-
-                    resultPayload = { type: 'query', text: followupResponse.text };
-                    success = true;
-                }
-            } else {
-                // If the model didn't call a tool, it likely means invalid request or casual chat
-                resultPayload = { type: 'chat', text: response.text };
+            try {
+                response = await ai.models.generateContent({
+                    model: 'gemini-3.6-flash',
+                    contents: contents,
+                    config: {
+                        tools: geminiTools
+                    }
+                });
                 success = true;
-            }
-        } catch (apiError) {
-            lastError = apiError;
-            console.error(`[DEBUG] ❌ Gemini API threw an error on attempt ${attempts}:`, apiError.message);
+            } catch (apiError) {
+                lastError = apiError;
+                console.error(`[DEBUG] ❌ Gemini API error on attempt ${attempts} (turn ${turn}):`, apiError.message);
 
-            const retryable = isRetryableGeminiError(apiError);
+                const retryable = isRetryableGeminiError(apiError);
 
-            if (retryable && attempts < maxAttempts) {
-                const retryCount = attempts;
-                const baseDelay = 1000 * Math.pow(2, retryCount - 1);
-                const jitter = Math.floor(Math.random() * 500);
-                const delay = Math.min(baseDelay + jitter, 10000);
+                if (retryable && attempts < maxAttempts) {
+                    const retryCount = attempts;
+                    const baseDelay = 1000 * Math.pow(2, retryCount - 1);
+                    const jitter = Math.floor(Math.random() * 500);
+                    const delay = Math.min(baseDelay + jitter, 10000);
 
-                console.warn(`[DEBUG] ⚠️ Transient Gemini error encountered (${apiError.message}). Retrying in ${delay}ms... (Retry ${retryCount}/${MAX_RETRIES})`);
-                await sleep(delay);
-            } else {
-                if (!retryable) {
-                    console.error(`[DEBUG] ❌ Non-retryable error encountered. Aborting retries.`);
+                    console.warn(`[DEBUG] ⚠️ Transient Gemini error encountered (${apiError.message}). Retrying in ${delay}ms... (Retry ${retryCount}/${MAX_RETRIES})`);
+                    await sleep(delay);
                 } else {
-                    console.error(`[DEBUG] ❌ All ${MAX_RETRIES} retries exhausted.`);
+                    if (!retryable) {
+                        console.error(`[DEBUG] ❌ Non-retryable error encountered. Aborting retries.`);
+                    } else {
+                        console.error(`[DEBUG] ❌ All ${MAX_RETRIES} retries exhausted.`);
+                    }
+                    break;
                 }
-                break;
             }
         }
-    }
 
-    if (!success) {
-        return { error: `API Connection Failed: ${lastError?.message}. Check if your model name is valid.` };
-    }
-
-    // Process the result if it was a logging request
-    if (resultPayload.type === 'log') {
-        const expenseData = resultPayload.data;
-
-        if (expenseData.is_error) {
-            console.log(`⚠️ Blocked invalid expense due to missing info: ${expenseData.error_message}`);
-            return { error: expenseData.error_message };
+        if (!success) {
+            return { error: `API Connection Failed: ${lastError?.message}. Check if your model name is valid.` };
         }
 
-        const d = new Date();
-        const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-        const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
-        const addedAtTime = `${datePart} ${timePart}`;
-
-        console.log("🧠 Parsed Expense Data from Gemini:", JSON.stringify(expenseData, null, 2));
-
-        if (sheets && spreadsheetId) {
-            const sheetName = getMonthSheetName(expenseData.date);
-            await ensureMonthlySheetExists(sheetName, spreadsheetId);
-
-            const values = [[
-                expenseData.date,
-                expenseData.amount,
-                expenseData.category,
-                expenseData.subcategory,
-                expenseData.merchant,
-                expenseData.description,
-                expenseData.payment_method,
-                expenseData.need_want,
-                addedAtTime,
-                `=SUM($B$2:INDIRECT("B"&ROW()))`
-            ]];
-
-            await sheets.spreadsheets.values.append({
-                spreadsheetId: spreadsheetId,
-                range: `${sheetName}!A:J`,
-                valueInputOption: 'USER_ENTERED',
-                requestBody: { values }
-            });
+        const candidate = response.candidates?.[0];
+        if (!candidate || !candidate.content) {
+            console.warn(`[DEBUG] Empty candidate returned by Gemini on turn ${turn}`);
+            break;
         }
 
-        return { type: 'log', data: expenseData };
+        // Add model candidate to conversation history
+        contents.push(candidate.content);
+
+        const functionCalls = response.functionCalls;
+        if (response.text && response.text.trim()) {
+            finalModelText = response.text.trim();
+        }
+
+        if (!functionCalls || functionCalls.length === 0) {
+            console.log(`[DEBUG] Turn ${turn}: No tool calls requested. Agent loop complete.`);
+            break;
+        }
+
+        console.log(`[DEBUG] Turn ${turn}: ${functionCalls.length} tool call(s) requested:`, functionCalls.map(f => f.name));
+
+        // Execute all function calls (handles multiple tool calls in parallel or sequence)
+        const functionResponseParts = [];
+        for (const call of functionCalls) {
+            executedToolsCount++;
+            let toolResult;
+            if (call.name === "logExpense" || call.name === "addExpense") {
+                logCount++;
+                toolResult = await executeLogExpense(call.args, spreadsheetId, { chatId, sendTelegramReply });
+            } else if (call.name === "queryExpenses") {
+                queryCount++;
+                toolResult = await executeQueryExpenses(call.args, spreadsheetId);
+            } else {
+                toolResult = { error: `Unknown tool: ${call.name}` };
+            }
+
+            const part = {
+                functionResponse: {
+                    name: call.name,
+                    response: toolResult
+                }
+            };
+            if (call.id) {
+                part.functionResponse.id = call.id;
+            }
+            functionResponseParts.push(part);
+        }
+
+        // Feed tool results back to Gemini for next loop turn
+        contents.push({
+            role: "user",
+            parts: functionResponseParts
+        });
     }
 
-    // Pass through query or chat results
-    return resultPayload;
+    // If only expense logging was performed without any queries or questions,
+    // the logExpense tool already sent the Telegram confirmations directly.
+    // Suppress any redundant trailing summary text.
+    if (logCount > 0 && queryCount === 0) {
+        finalModelText = null;
+    }
+
+    return {
+        success: true,
+        finalReply: finalModelText,
+        executedToolsCount
+    };
 }
 
 async function getTodayTotal(spreadsheetId) {

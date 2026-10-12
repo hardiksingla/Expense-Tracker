@@ -185,15 +185,12 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             await sendTelegramReply(chatId, `🎨 Here is your magic link to the dashboard (valid for 7 days):\n${magicLink}`);
         }
         else {
-            const aiResult = await processExpenseMessage(text, spreadsheetId);
+            const aiResult = await processExpenseMessage(text, spreadsheetId, { chatId, sendTelegramReply });
             if (aiResult.error) {
                 // LLM or Service error
                 await sendTelegramReply(chatId, `⚠️ Oops! ${aiResult.error}`);
-            } else if (aiResult.type === 'log') {
-                const expenseData = aiResult.data;
-                await sendTelegramReply(chatId, `✅ Added Expense: ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).`);
-            } else if (aiResult.type === 'query' || aiResult.type === 'chat') {
-                await sendTelegramReply(chatId, aiResult.text);
+            } else if (aiResult.finalReply) {
+                await sendTelegramReply(chatId, aiResult.finalReply);
             }
         }
 
