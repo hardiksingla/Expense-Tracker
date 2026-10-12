@@ -5,9 +5,65 @@ const fs = require('fs');
 // Initialize Gemini keys list
 const GEMINI_API_KEYS = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.split(',').map(k => k.trim()).filter(Boolean) : [];
 
+let currentKeyIndex = 0;
 function getRandomGeminiKey() {
     if (GEMINI_API_KEYS.length === 0) return null;
-    return GEMINI_API_KEYS[Math.floor(Math.random() * GEMINI_API_KEYS.length)];
+    const key = GEMINI_API_KEYS[currentKeyIndex % GEMINI_API_KEYS.length];
+    currentKeyIndex = (currentKeyIndex + 1) % GEMINI_API_KEYS.length;
+    return key;
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isRetryableGeminiError(error) {
+    if (!error) return false;
+
+    // Direct status or code checks
+    const status = error.status || error.code || (error.response && error.response.status);
+    if (status === 503 || status === 429 || status === 'UNAVAILABLE' || status === 'RESOURCE_EXHAUSTED') {
+        return true;
+    }
+    if (typeof status === 'number' && status >= 500 && status < 600) {
+        return true;
+    }
+
+    // Message string checks
+    const msg = error.message || String(error);
+    if (
+        msg.includes('503') ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('high demand') ||
+        msg.includes('temporarily') ||
+        msg.includes('429') ||
+        msg.includes('Too Many Requests') ||
+        msg.includes('quota') ||
+        msg.includes('RESOURCE_EXHAUSTED') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('fetch failed')
+    ) {
+        return true;
+    }
+
+    // Try parsing if message contains JSON string
+    try {
+        const jsonMatch = msg.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const code = parsed?.error?.code || parsed?.code;
+            const errStatus = parsed?.error?.status || parsed?.status;
+            if (code === 503 || code === 429 || errStatus === 'UNAVAILABLE' || errStatus === 'RESOURCE_EXHAUSTED') {
+                return true;
+            }
+            if (typeof code === 'number' && code >= 500 && code < 600) {
+                return true;
+            }
+        }
+    } catch (_) {
+        // Not valid JSON, ignore
+    }
+
+    return false;
 }
 // Setup Google Sheets auth
 let sheets = null;
@@ -139,7 +195,8 @@ async function processExpenseMessage(message, spreadsheetId) {
     let resultPayload = null;
     let success = false;
     let attempts = 0;
-    const maxAttempts = GEMINI_API_KEYS.length > 0 ? Math.min(GEMINI_API_KEYS.length + 1, 3) : 1;
+    const MAX_RETRIES = 3;
+    const maxAttempts = MAX_RETRIES + 1; // 1 initial attempt + 3 retries
     let lastError = null;
 
     while (!success && attempts < maxAttempts) {
@@ -195,12 +252,22 @@ async function processExpenseMessage(message, spreadsheetId) {
             lastError = apiError;
             console.error(`[DEBUG] ❌ Gemini API threw an error on attempt ${attempts}:`, apiError.message);
 
-            const isRateLimit = apiError.status === 429 ||
-                (apiError.message && (apiError.message.includes('429') || apiError.message.includes('Too Many Requests') || apiError.message.includes('quota')));
+            const retryable = isRetryableGeminiError(apiError);
 
-            if (isRateLimit && attempts < maxAttempts) {
-                console.log(`⚠️ 429 error encountered limit hit. Retrying with another key...`);
+            if (retryable && attempts < maxAttempts) {
+                const retryCount = attempts;
+                const baseDelay = 1000 * Math.pow(2, retryCount - 1);
+                const jitter = Math.floor(Math.random() * 500);
+                const delay = Math.min(baseDelay + jitter, 10000);
+
+                console.warn(`[DEBUG] ⚠️ Transient Gemini error encountered (${apiError.message}). Retrying in ${delay}ms... (Retry ${retryCount}/${MAX_RETRIES})`);
+                await sleep(delay);
             } else {
+                if (!retryable) {
+                    console.error(`[DEBUG] ❌ Non-retryable error encountered. Aborting retries.`);
+                } else {
+                    console.error(`[DEBUG] ❌ All ${MAX_RETRIES} retries exhausted.`);
+                }
                 break;
             }
         }
@@ -619,5 +686,7 @@ module.exports = {
     undoLastExpense,
     getLastExpense,
     getAllExpenses,
-    verifySpreadsheetAccess
+    verifySpreadsheetAccess,
+    isRetryableGeminiError,
+    sleep
 };
