@@ -6,7 +6,7 @@ const cors = require('cors');
 const { connectDB, User } = require('./models');
 connectDB();
 const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses, verifySpreadsheetAccess } = require('./expenseService');
-const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./middleware');
+const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -233,3 +233,6 @@ app.listen(PORT, () => {
     if (!process.env.TELEGRAM_BOT_TOKEN) console.warn("⚠️ TELEGRAM_BOT_TOKEN is missing from .env");
     console.log(`🚀 Webhook server is running on port ${PORT}`);
 });
+
+module.exports = app;
+
