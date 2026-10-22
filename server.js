@@ -1,3 +1,5 @@
+const dns = require('dns');
+try { dns.setServers(['8.8.8.8', '8.8.4.4']); } catch (_) {}
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -5,7 +7,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { connectDB, User } = require('./models');
 connectDB();
-const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses, verifySpreadsheetAccess } = require('./expenseService');
+const { processExpenseMessage, getTodayTotal, getMonthTotal, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense, getAllExpenses, verifySpreadsheetAccess, refreshFuelPrices, ensureBikeSheetsExist } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
@@ -89,7 +91,7 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
 
         // Safe access Telegram message payload
         const msgObj = payload?.message;
-        const { username, spreadsheetId } = req;
+        const { username, spreadsheetId, bikeSpreadsheetId } = req;
         const text = msgObj.text;
         const chatId = req.chatId || msgObj.chat?.id;
 
@@ -100,12 +102,47 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
         console.log(`Processing Telegram Command: "${text}" from ${username}`);
 
         if (text === '/start') {
-            await sendTelegramReply(chatId, `Hello ${username}! Welcome to your personal expense tracker. 📊\n\nTo get started, please follow these steps:\n1. Create a new Google Sheet.\n2. Share the Google Sheet as an **Editor** with our service bot:\nsheet-bot@hazel-charter-505618-s2.iam.gserviceaccount.com\n3. Copy the URL of the Google Sheet and send it to me here.\n\nOnce done, you can start logging expenses immediately!`);
+            await sendTelegramReply(chatId, `Hello ${username}! Welcome to your personal expense tracker. 📊\n\nTo get started with personal expenses:\n1. Create a new Google Sheet.\n2. Share it as an **Editor** with our service bot:\nsheet-bot@hazel-charter-505618-s2.iam.gserviceaccount.com\n3. Copy the URL of the Google Sheet and send it to me here.\n\n🏍️ **Triumph Speed 400 Motorcycle Tracker**:\nTo track fuel, maintenance, and bike observations, share a dedicated Google Sheet with the bot and send:\n/bikesheet <Google Sheet URL>\n\nOnce done, you can start logging expenses immediately!`);
             return res.status(200).send('Telegram webhook processed');
         }
 
-        if (text.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)) {
+        if (text.startsWith('/bikesheet') || text.startsWith('/bike_sheet')) {
             const match = text.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+            if (!match) {
+                await sendTelegramReply(chatId, `⚠️ Please provide a valid Google Sheet URL. Example:\n/bikesheet https://docs.google.com/spreadsheets/d/your-sheet-id`);
+                return res.status(200).send('Telegram webhook processed');
+            }
+            const newBikeSpreadsheetId = match[1];
+
+            const hasAccess = await verifySpreadsheetAccess(newBikeSpreadsheetId);
+            if (!hasAccess) {
+                await sendTelegramReply(chatId, `⚠️ I couldn't access that Google Sheet. Please make sure you have shared it with:\nsheet-bot@hazel-charter-505618-s2.iam.gserviceaccount.com\nas an **Editor** and try sending the link again.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
+
+            await User.findOneAndUpdate(
+                { chatId },
+                { username, bikeSpreadsheetId: newBikeSpreadsheetId },
+                { upsert: true, returnDocument: 'after' }
+            );
+            await ensureBikeSheetsExist(newBikeSpreadsheetId);
+            await sendTelegramReply(chatId, `🏍️ Success! Linked your Triumph Speed 400 bike tracker.\nWorksheets 'BikeExpenses' and 'FuelPrices' are configured.\nYou can now log fuel refills (e.g., "500 petrol odo 1200"), service expenses, or observations!`);
+            return res.status(200).send('Telegram webhook processed');
+        }
+
+        if (text === '/sheets' || text === '/status') {
+            const expMsg = spreadsheetId ? `✅ Linked (\`${spreadsheetId}\`)` : `❌ Not linked (send sheet link or /expensesheet <URL>)`;
+            const bikeMsg = bikeSpreadsheetId ? `✅ Linked (\`${bikeSpreadsheetId}\`)` : `❌ Not linked (send /bikesheet <URL>)`;
+            await sendTelegramReply(chatId, `📊 **Your Configured Spreadsheets**:\n\n1️⃣ **Personal Expenses Sheet**:\n${expMsg}\n\n2️⃣ **Triumph Speed 400 Bike Sheet**:\n${bikeMsg}\n\n💡 **How to link or change**:\n• Personal expenses: \`/expensesheet <Google Sheet URL>\` (or paste link)\n• Bike tracker: \`/bikesheet <Google Sheet URL>\``);
+            return res.status(200).send('Telegram webhook processed');
+        }
+
+        if (text.startsWith('/expensesheet') || text.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)) {
+            const match = text.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+            if (!match) {
+                await sendTelegramReply(chatId, `⚠️ Please provide a valid Google Sheet URL. Example:\n/expensesheet https://docs.google.com/spreadsheets/d/your-sheet-id`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const newSpreadsheetId = match[1];
 
             const hasAccess = await verifySpreadsheetAccess(newSpreadsheetId);
@@ -117,9 +154,9 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             await User.findOneAndUpdate(
                 { chatId },
                 { username, spreadsheetId: newSpreadsheetId },
-                { upsert: true, new: true }
+                { upsert: true, returnDocument: 'after' }
             );
-            await sendTelegramReply(chatId, `🎉 Success! I've linked your Google Sheet. You can now start logging expenses directly by typing them (e.g., "150 lunch").`);
+            await sendTelegramReply(chatId, `🎉 Success! Linked your Personal Expense Sheet.\nYou can now start logging expenses directly by typing them (e.g., "150 lunch").`);
             return res.status(200).send('Telegram webhook processed');
         }
 
@@ -184,8 +221,26 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             const magicLink = `${protocol}://${host}/?token=${token}`;
             await sendTelegramReply(chatId, `🎨 Here is your magic link to the dashboard (valid for 7 days):\n${magicLink}`);
         }
+        else if (text === '/refreshfuel' || text === '/refreshfuelprices') {
+            if (!bikeSpreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ No bike spreadsheet configured. Link one with /bikesheet <Google Sheet URL>.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
+            const result = await refreshFuelPrices(bikeSpreadsheetId);
+            if (result.error) {
+                await sendTelegramReply(chatId, `⚠️ Error refreshing fuel prices: ${result.error}`);
+            } else {
+                const lines = result.prices.map(p => `• ${p.original_name || p.fuel_name}: ₹${p.price_per_litre.toFixed(2)}/L${p.is_default ? ' (Default)' : ''}${p.active ? '' : ' [Inactive]'}`);
+                await sendTelegramReply(chatId, `⛽ Fuel prices refreshed from sheet:\n${lines.join('\n')}`);
+            }
+        }
         else {
-            const aiResult = await processExpenseMessage(text, spreadsheetId, { chatId, sendTelegramReply });
+            const aiResult = await processExpenseMessage(text, spreadsheetId, {
+                chatId,
+                sendTelegramReply,
+                bikeSpreadsheetId,
+                messageId: msgObj.message_id
+            });
             if (aiResult.error) {
                 // LLM or Service error
                 await sendTelegramReply(chatId, `⚠️ Oops! ${aiResult.error}`);

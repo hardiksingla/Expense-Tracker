@@ -1,6 +1,7 @@
 const { GoogleGenAI } = require('@google/genai');
 const { google } = require('googleapis');
 const fs = require('fs');
+const path = require('path');
 
 // Initialize Gemini keys list
 const GEMINI_API_KEYS = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.split(',').map(k => k.trim()).filter(Boolean) : [];
@@ -94,6 +95,10 @@ try {
     console.error("❌ Error setting up Google Sheets auth:", error.message);
 }
 
+function getSheetsClient() {
+    return sheets;
+}
+
 const CATEGORIES = [
     "Food & Dining",
     "Transportation",
@@ -107,43 +112,587 @@ const CATEGORIES = [
     "Miscellaneous"
 ];
 
-const geminiTools = [{
-    functionDeclarations: [
-        {
-            name: "logExpense",
-            description: "Logs a new expense or income. Automatically records to Google Sheets and sends a Telegram confirmation to the user. Use this tool if the user provides a transaction or an expense to record. Generate dummy values if is_error is true. If the user mentions earning money (or uses a negative amount), the logged amount must be a negative number.",
-            parameters: {
-                type: "OBJECT",
-                properties: {
-                    is_error: { type: "BOOLEAN", description: "Set to true if there is missing vital information to log the expense, like amount." },
-                    error_message: { type: "STRING", description: "Friendly message asking for the missing info if is_error is true." },
-                    amount: { type: "NUMBER" },
-                    category: { type: "STRING", enum: CATEGORIES, description: "Must be one of the provided categories." },
-                    subcategory: { type: "STRING" },
-                    description: { type: "STRING" },
-                    merchant: { type: "STRING" },
-                    payment_method: { type: "STRING", description: "Default to 'UPI' if unspecified." },
-                    need_want: { type: "STRING", enum: ["Need", "Want"] },
-                    date: { type: "STRING", description: "YYYY-MM-DD format" },
-                },
-                required: ["is_error", "error_message", "amount", "category", "subcategory", "description", "merchant", "payment_method", "need_want", "date"],
+const BIKE_CATEGORIES = [
+    "petrol", "premium petrol", "XP95",
+    "scheduled_service", "oil_change", "oil_filter", "air_filter", "spark_plug",
+    "chain_lube", "chain_adjustment", "brake_pads", "brake_fluid", "coolant",
+    "battery", "tyre", "puncture", "repair", "accessory", "riding_gear",
+    "washing", "parking", "toll", "fine", "insurance", "registration",
+    "loan_interest", "brake_issue", "engine_vibration", "tyre_wear", "observation", "other"
+];
+
+const logExpenseDeclaration = {
+    name: "logExpense",
+    description: "Logs a new expense or income. Automatically records to Google Sheets and sends a Telegram confirmation to the user. Use this tool if the user provides a transaction or an expense to record. Generate dummy values if is_error is true. If the user mentions earning money (or uses a negative amount), the logged amount must be a negative number.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            is_error: { type: "BOOLEAN", description: "Set to true if there is missing vital information to log the expense, like amount." },
+            error_message: { type: "STRING", description: "Friendly message asking for the missing info if is_error is true." },
+            amount: { type: "NUMBER" },
+            category: { type: "STRING", enum: CATEGORIES, description: "Must be one of the provided categories." },
+            subcategory: { type: "STRING" },
+            description: { type: "STRING" },
+            merchant: { type: "STRING" },
+            payment_method: { type: "STRING", description: "Default to 'UPI' if unspecified." },
+            need_want: { type: "STRING", enum: ["Need", "Want"] },
+            date: { type: "STRING", description: "YYYY-MM-DD format" },
+        },
+        required: ["is_error", "error_message", "amount", "category", "subcategory", "description", "merchant", "payment_method", "need_want", "date"],
+    }
+};
+
+const queryExpensesDeclaration = {
+    name: "queryExpenses",
+    description: "Queries past expenses for a specific timeframe. Use this when the user asks questions like 'how much did I spend on food this week?'.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            startDate: { type: "STRING", description: "YYYY-MM-DD" },
+            endDate: { type: "STRING", description: "YYYY-MM-DD" },
+            category: { type: "STRING", description: "Optional category to filter by", enum: CATEGORIES }
+        },
+        required: ["startDate", "endDate"]
+    }
+};
+
+const logBikeEventDeclaration = {
+    name: "logBikeEvent",
+    description: "Logs an expense, maintenance event, or observation for a Triumph Speed 400 motorcycle into the dedicated bike spreadsheet. Supports 3 event types: 'fuel' for petrol/XP95 refills, 'service' for repairs/maintenance/servicing/accessories, and 'log' for observations/notes/issues without an expense. Only extract explicitly stated values; DO NOT calculate fuel conversions yourself.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            event_type: {
+                type: "STRING",
+                enum: ["fuel", "service", "log"],
+                description: "Type of event: 'fuel' for fuel refills, 'service' for maintenance/service/accessories, 'log' for notes/issues/observations without expense."
+            },
+            category: {
+                type: "STRING",
+                description: "Category of the event. For fuel: fuel type (e.g., 'petrol', 'XP95'). For service: e.g. 'scheduled_service', 'oil_change', 'oil_filter', 'chain_lube', 'brake_pads', 'washing', 'parking'. For log: e.g. 'brake_issue', 'engine_vibration', 'tyre_wear', 'observation'."
+            },
+            odo: {
+                type: "NUMBER",
+                description: "Motorcycle odometer reading in kilometres if mentioned (numeric, e.g. 1500). Leave null if omitted."
+            },
+            money: {
+                type: "NUMBER",
+                description: "Amount paid in INR if mentioned (numeric, e.g. 500). For 'log' type, leave null. For fuel or service, only provide if stated."
+            },
+            litres: {
+                type: "NUMBER",
+                description: "Litres of fuel purchased if stated (numeric, e.g. 4.5). Only applicable for fuel. Leave null if not mentioned."
+            },
+            fuel_name: {
+                type: "STRING",
+                description: "Fuel brand or type if mentioned (e.g. 'petrol', 'premium petrol', 'XP95'). Leave null if omitted."
+            },
+            description: {
+                type: "STRING",
+                description: "Clean, human-readable summary of the bike expense or observation."
+            },
+            merchant: {
+                type: "STRING",
+                description: "Workshop, petrol pump brand, or merchant if mentioned (e.g. 'IndianOil', 'Triumph Service Center')."
+            },
+            payment_method: {
+                type: "STRING",
+                description: "Payment method used (default 'UPI')."
+            },
+            date: {
+                type: "STRING",
+                description: "YYYY-MM-DD date if mentioned, otherwise leave null."
             }
         },
-        {
-            name: "queryExpenses",
-            description: "Queries past expenses for a specific timeframe. Use this when the user asks questions like 'how much did I spend on food this week?'.",
-            parameters: {
-                type: "OBJECT",
-                properties: {
-                    startDate: { type: "STRING", description: "YYYY-MM-DD" },
-                    endDate: { type: "STRING", description: "YYYY-MM-DD" },
-                    category: { type: "STRING", description: "Optional category to filter by", enum: CATEGORIES }
-                },
-                required: ["startDate", "endDate"]
+        required: ["event_type", "description"]
+    }
+};
+
+const geminiTools = [{
+    functionDeclarations: [logExpenseDeclaration, queryExpensesDeclaration]
+}];
+
+// --- Triumph Speed 400 Bike Tracker State & Helpers ---
+const fuelPricesCache = new Map(); // bikeSpreadsheetId -> { prices: [...], lastFetched: number }
+const BIKE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function formatISTDateTime(dateObj = new Date()) {
+    const d = new Date(dateObj);
+    const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+    return `${datePart} ${timePart}`;
+}
+
+function formatISTDate(dateObj = new Date()) {
+    const d = new Date(dateObj);
+    return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+function generateBikeEntryId() {
+    return `bike_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+}
+
+async function ensureBikeSheetsExist(bikeSpreadsheetId) {
+    if (!sheets || !bikeSpreadsheetId) return;
+
+    try {
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: bikeSpreadsheetId });
+        const existingTitles = spreadsheetInfo.data.sheets.map(s => s.properties.title);
+
+        const requests = [];
+        if (!existingTitles.includes('BikeExpenses')) {
+            requests.push({ addSheet: { properties: { title: 'BikeExpenses' } } });
+        }
+        if (!existingTitles.includes('FuelPrices')) {
+            requests.push({ addSheet: { properties: { title: 'FuelPrices' } } });
+        }
+
+        if (requests.length > 0) {
+            console.log(`[BikeService] Creating missing sheets:`, requests.map(r => r.addSheet.properties.title));
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId: bikeSpreadsheetId,
+                requestBody: { requests }
+            });
+        }
+
+        if (!existingTitles.includes('BikeExpenses')) {
+            const expenseHeaders = [[
+                "id", "date_time", "type", "category", "odo", "money",
+                "description", "fuel_name", "litres", "price_per_litre", "telegram_message_id"
+            ]];
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: bikeSpreadsheetId,
+                range: 'BikeExpenses!A1:K1',
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: expenseHeaders }
+            });
+            console.log("✅ [BikeService] Initialized BikeExpenses headers");
+        }
+
+        if (!existingTitles.includes('FuelPrices')) {
+            const fuelHeaders = [["fuel_name", "price_per_litre", "is_default", "active"]];
+            const initialFuels = [
+                ["petrol", 103.50, "TRUE", "TRUE"],
+                ["premium petrol", 110.00, "FALSE", "TRUE"],
+                ["XP95", 111.00, "FALSE", "TRUE"]
+            ];
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: bikeSpreadsheetId,
+                range: 'FuelPrices!A1:D4',
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: [...fuelHeaders, ...initialFuels] }
+            });
+            console.log("✅ [BikeService] Initialized FuelPrices with default values");
+        }
+    } catch (err) {
+        console.error("❌ [BikeService] Error ensuring bike sheets exist:", err.message);
+    }
+}
+
+async function getFuelPrices(bikeSpreadsheetId, forceRefresh = false) {
+    if (!bikeSpreadsheetId) return { error: "No bike spreadsheet ID provided." };
+
+    const cached = fuelPricesCache.get(bikeSpreadsheetId);
+    if (!forceRefresh && cached && (Date.now() - cached.lastFetched < BIKE_CACHE_TTL_MS)) {
+        return { prices: cached.prices };
+    }
+
+    if (!sheets) {
+        const fallbackPrices = [
+            { fuel_name: 'petrol', original_name: 'petrol', price_per_litre: 103.50, is_default: true, active: true },
+            { fuel_name: 'premium petrol', original_name: 'premium petrol', price_per_litre: 110.00, is_default: false, active: true },
+            { fuel_name: 'xp95', original_name: 'XP95', price_per_litre: 111.00, is_default: false, active: true }
+        ];
+        return { prices: fallbackPrices };
+    }
+
+    try {
+        await ensureBikeSheetsExist(bikeSpreadsheetId);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: bikeSpreadsheetId,
+            range: 'FuelPrices!A2:D'
+        }).catch(() => null);
+
+        let rows = response?.data?.values;
+        if (!rows || rows.length === 0) {
+            const initialFuels = [
+                ["petrol", 103.50, "TRUE", "TRUE"],
+                ["premium petrol", 110.00, "FALSE", "TRUE"],
+                ["XP95", 111.00, "FALSE", "TRUE"]
+            ];
+            await sheets.spreadsheets.values.append({
+                spreadsheetId: bikeSpreadsheetId,
+                range: 'FuelPrices!A:D',
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: initialFuels }
+            });
+            rows = initialFuels;
+        }
+
+        const prices = [];
+        for (const row of rows) {
+            const rawName = row[0]?.toString().trim();
+            if (!rawName) continue;
+
+            const price = parseFloat(row[1]) || 0;
+            const isDefault = String(row[2]).trim().toUpperCase() === 'TRUE';
+            const isActive = String(row[3]).trim().toUpperCase() === 'TRUE';
+
+            prices.push({
+                fuel_name: rawName.toLowerCase(),
+                original_name: rawName,
+                price_per_litre: Math.round(price * 100) / 100,
+                is_default: isDefault,
+                active: isActive
+            });
+        }
+
+        const activeDefaults = prices.filter(p => p.active && p.is_default);
+        if (activeDefaults.length === 0) {
+            return { error: "Invalid FuelPrices configuration: No active default fuel marked as is_default = TRUE." };
+        }
+        if (activeDefaults.length > 1) {
+            return { error: `Invalid FuelPrices configuration: Multiple active fuels marked as is_default = TRUE (${activeDefaults.map(p => p.original_name).join(', ')}).` };
+        }
+
+        fuelPricesCache.set(bikeSpreadsheetId, {
+            prices,
+            lastFetched: Date.now()
+        });
+
+        return { prices };
+    } catch (err) {
+        console.error("❌ [BikeService] Error fetching fuel prices:", err.message);
+        if (!bikeSpreadsheetId || bikeSpreadsheetId.includes('dummy') || bikeSpreadsheetId.includes('test')) {
+            const fallbackPrices = [
+                { fuel_name: 'petrol', original_name: 'petrol', price_per_litre: 103.50, is_default: true, active: true },
+                { fuel_name: 'premium petrol', original_name: 'premium petrol', price_per_litre: 110.00, is_default: false, active: true },
+                { fuel_name: 'xp95', original_name: 'XP95', price_per_litre: 111.00, is_default: false, active: true }
+            ];
+            return { prices: fallbackPrices };
+        }
+        return { error: `Failed to fetch fuel prices: ${err.message}` };
+    }
+}
+
+async function refreshFuelPrices(bikeSpreadsheetId) {
+    return await getFuelPrices(bikeSpreadsheetId, true);
+}
+
+async function getLatestOdometer(bikeSpreadsheetId) {
+    if (!sheets || !bikeSpreadsheetId) return null;
+
+    try {
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: bikeSpreadsheetId,
+            range: 'BikeExpenses!E2:E'
+        }).catch(() => null);
+
+        const rows = response?.data?.values;
+        if (!rows || rows.length === 0) return null;
+
+        for (let i = rows.length - 1; i >= 0; i--) {
+            const val = rows[i]?.[0];
+            if (val !== undefined && val !== null && val.toString().trim() !== '') {
+                const num = parseFloat(val.toString().replace(/,/g, ''));
+                if (!isNaN(num) && num >= 0) {
+                    return num;
+                }
             }
         }
-    ]
-}];
+        return null;
+    } catch (err) {
+        console.error("❌ [BikeService] Error reading latest odometer:", err.message);
+        return null;
+    }
+}
+
+async function isDuplicateBikeEntry(bikeSpreadsheetId, telegramMessageId) {
+    if (!telegramMessageId || !sheets || !bikeSpreadsheetId) return false;
+
+    try {
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: bikeSpreadsheetId,
+            range: 'BikeExpenses!K2:K'
+        }).catch(() => null);
+
+        const rows = response?.data?.values;
+        if (!rows || rows.length === 0) return false;
+
+        return rows.some(r => r[0] && r[0].toString().trim() === telegramMessageId);
+    } catch (err) {
+        console.error("❌ [BikeService] Error checking duplicate entry:", err.message);
+        return false;
+    }
+}
+
+function computeFuelDetails({ money, litres, fuel_name, prices }) {
+    let matchedFuel = null;
+    if (!fuel_name || !fuel_name.trim()) {
+        matchedFuel = prices.find(p => p.active && p.is_default);
+        if (!matchedFuel) {
+            return { error: "No active default fuel configured in FuelPrices." };
+        }
+    } else {
+        const normInput = fuel_name.trim().toLowerCase();
+        matchedFuel = prices.find(p => p.fuel_name === normInput);
+        if (!matchedFuel || !matchedFuel.active) {
+            const activeFuels = prices.filter(p => p.active).map(p => p.original_name || p.fuel_name);
+            return {
+                error: `Unknown or inactive fuel type "${fuel_name}". Active options: ${activeFuels.join(', ')}.`
+            };
+        }
+    }
+
+    const priceConfig = matchedFuel.price_per_litre;
+    const resolvedFuelName = matchedFuel.original_name || matchedFuel.fuel_name;
+
+    const hasMoney = money !== undefined && money !== null && !isNaN(parseFloat(money)) && parseFloat(money) > 0;
+    const hasLitres = litres !== undefined && litres !== null && !isNaN(parseFloat(litres)) && parseFloat(litres) > 0;
+
+    if (!hasMoney && !hasLitres) {
+        return {
+            error: "Please specify either the amount paid (e.g., ₹500) or litres purchased (e.g., 5L) to log your fuel refill."
+        };
+    }
+
+    if (hasMoney && !hasLitres) {
+        const m = Math.round(parseFloat(money) * 100) / 100;
+        const l = Math.round((m / priceConfig) * 1000) / 1000; // 3 decimals
+        return {
+            money: m,
+            litres: l,
+            price_per_litre: priceConfig,
+            fuel_name: resolvedFuelName
+        };
+    }
+
+    if (!hasMoney && hasLitres) {
+        const l = Math.round(parseFloat(litres) * 1000) / 1000;
+        const m = Math.round((l * priceConfig) * 100) / 100; // 2 decimals
+        return {
+            money: m,
+            litres: l,
+            price_per_litre: priceConfig,
+            fuel_name: resolvedFuelName
+        };
+    }
+
+    const m = Math.round(parseFloat(money) * 100) / 100;
+    const l = Math.round(parseFloat(litres) * 1000) / 1000;
+    const impliedPrice = Math.round((m / l) * 100) / 100;
+    let discrepancyWarning = null;
+
+    if (Math.abs(impliedPrice - priceConfig) >= 0.01) {
+        discrepancyWarning = `⚠️ Note: Implied price ₹${impliedPrice.toFixed(2)}/L differs from configured price ₹${priceConfig.toFixed(2)}/L.`;
+    }
+
+    return {
+        money: m,
+        litres: l,
+        price_per_litre: impliedPrice,
+        fuel_name: resolvedFuelName,
+        discrepancyWarning
+    };
+}
+
+async function executeLogBikeEvent(args, bikeSpreadsheetId, primarySpreadsheetId, { chatId, sendTelegramReply, messageId } = {}) {
+    console.log("🏍️ [BikeService] Executing logBikeEvent with args:", JSON.stringify(args, null, 2));
+
+    if (!bikeSpreadsheetId) {
+        const errMsg = "No bike spreadsheet configured. Please set your bike spreadsheet first.";
+        if (chatId && sendTelegramReply) await sendTelegramReply(chatId, `⚠️ ${errMsg}`);
+        return { success: false, error: errMsg };
+    }
+
+    const {
+        event_type,
+        category,
+        odo,
+        money,
+        litres,
+        fuel_name,
+        description,
+        merchant,
+        payment_method,
+        date
+    } = args || {};
+
+    const telegramMessageId = (chatId && messageId) ? `${chatId}_${messageId}` : "";
+
+    // 1. Idempotency Check
+    if (telegramMessageId) {
+        const duplicate = await isDuplicateBikeEntry(bikeSpreadsheetId, telegramMessageId);
+        if (duplicate) {
+            console.log(`[BikeService] Duplicate message detected: ${telegramMessageId}`);
+            if (chatId && sendTelegramReply) {
+                await sendTelegramReply(chatId, `ℹ️ This bike entry was already recorded.`);
+            }
+            return { success: true, isDuplicate: true, message: "Duplicate entry already recorded." };
+        }
+    }
+
+    await ensureBikeSheetsExist(bikeSpreadsheetId);
+
+    // 2. Fetch Fuel Prices if fuel event
+    let computedFuel = null;
+    if (event_type === 'fuel') {
+        const pricesResult = await getFuelPrices(bikeSpreadsheetId);
+        if (!pricesResult || pricesResult.error) {
+            const errMsg = pricesResult?.error || "Failed to load fuel prices.";
+            if (chatId && sendTelegramReply) await sendTelegramReply(chatId, `⚠️ ${errMsg}`);
+            return { success: false, error: errMsg };
+        }
+
+        computedFuel = computeFuelDetails({
+            money,
+            litres,
+            fuel_name,
+            prices: pricesResult.prices
+        });
+
+        if (computedFuel.error) {
+            if (chatId && sendTelegramReply) await sendTelegramReply(chatId, `⚠️ ${computedFuel.error}`);
+            return { success: false, error: computedFuel.error };
+        }
+    }
+
+    // 3. Resolve Money & Litres & Category
+    let finalMoney = null;
+    let finalLitres = null;
+    let finalPricePerLitre = null;
+    let finalFuelName = "";
+    let finalCategory = category || "";
+
+    if (event_type === 'fuel') {
+        finalMoney = computedFuel.money;
+        finalLitres = computedFuel.litres;
+        finalPricePerLitre = computedFuel.price_per_litre;
+        finalFuelName = computedFuel.fuel_name;
+        finalCategory = finalFuelName;
+    } else if (event_type === 'service') {
+        finalMoney = (money !== undefined && money !== null && !isNaN(parseFloat(money)) && parseFloat(money) > 0)
+            ? Math.round(parseFloat(money) * 100) / 100
+            : null;
+        finalCategory = category || "service";
+    } else if (event_type === 'log') {
+        finalMoney = null;
+        finalCategory = category || "observation";
+    }
+
+    // 4. Odometer handling & sanity checks
+    let parsedOdo = (odo !== undefined && odo !== null && !isNaN(parseFloat(odo))) ? parseFloat(odo) : null;
+    const warnings = [];
+
+    if (parsedOdo !== null) {
+        const lastOdo = await getLatestOdometer(bikeSpreadsheetId);
+        if (lastOdo !== null) {
+            if (parsedOdo < lastOdo) {
+                warnings.push(`⚠️ Warning: Entered odometer (${parsedOdo.toLocaleString('en-IN')} km) is lower than last recorded reading (${lastOdo.toLocaleString('en-IN')} km).`);
+            } else if (parsedOdo - lastOdo > 1500) {
+                warnings.push(`⚠️ Note: Large odometer jump detected (+${(parsedOdo - lastOdo).toLocaleString('en-IN')} km).`);
+            }
+        }
+    }
+
+    if (computedFuel && computedFuel.discrepancyWarning) {
+        warnings.push(computedFuel.discrepancyWarning);
+    }
+
+    // 5. Date & Time Formatting
+    const now = new Date();
+    const dateTimeStr = formatISTDateTime(now);
+    const dateStr = date ? date : formatISTDate(now);
+    const uniqueId = generateBikeEntryId();
+
+    const finalDescription = description || (
+        event_type === 'fuel' ? `Fuel refill (${finalFuelName})` :
+        event_type === 'service' ? `Bike service (${finalCategory})` : `Bike log (${finalCategory})`
+    );
+
+    // 6. Record to Bike Spreadsheet: BikeExpenses
+    if (sheets && bikeSpreadsheetId) {
+        const rowValues = [[
+            uniqueId,
+            dateTimeStr,
+            event_type,
+            finalCategory,
+            parsedOdo !== null ? parsedOdo : "",
+            finalMoney !== null ? finalMoney : "",
+            finalDescription,
+            finalFuelName,
+            finalLitres !== null ? finalLitres : "",
+            finalPricePerLitre !== null ? finalPricePerLitre : "",
+            telegramMessageId
+        ]];
+
+        try {
+            await sheets.spreadsheets.values.append({
+                spreadsheetId: bikeSpreadsheetId,
+                range: 'BikeExpenses!A:K',
+                valueInputOption: 'USER_ENTERED',
+                requestBody: { values: rowValues }
+            });
+            console.log(`✅ [BikeService] Appended row to BikeExpenses (ID: ${uniqueId})`);
+        } catch (appendErr) {
+            console.error("❌ [BikeService] Error appending row to BikeExpenses:", appendErr.message);
+        }
+    }
+
+    // 7. Dual-Sheet Synchronization: If and only if money > 0
+    if (finalMoney !== null && finalMoney > 0 && primarySpreadsheetId) {
+        try {
+            let subcategory = "Bike";
+            if (event_type === 'fuel') subcategory = "Petrol";
+            else if (event_type === 'service') subcategory = "Service";
+
+            const dualExpenseData = {
+                is_error: false,
+                amount: finalMoney,
+                category: "Transportation",
+                subcategory: subcategory,
+                merchant: merchant || (event_type === 'fuel' ? (finalFuelName || "Petrol Pump") : "Triumph Speed 400"),
+                description: finalDescription,
+                payment_method: payment_method || "UPI",
+                need_want: "Need",
+                date: dateStr
+            };
+
+            await executeLogExpense(dualExpenseData, primarySpreadsheetId);
+            console.log(`✅ [BikeService] Synchronized ₹${finalMoney} bike expense to primary spreadsheet (${primarySpreadsheetId})`);
+        } catch (dualErr) {
+            console.error("❌ [BikeService] Dual-sheet sync error to primary spreadsheet:", dualErr.message);
+        }
+    }
+
+    // 8. Send Rich Confirmation Message to Telegram
+    if (chatId && sendTelegramReply) {
+        let msg = "";
+        const odoLine = parsedOdo !== null ? `\n• Odometer: ${parsedOdo.toLocaleString('en-IN')} km` : "";
+
+        if (event_type === 'fuel') {
+            msg = `⛽ Fuel expense saved\n• Type: ${finalFuelName}\n• Amount: ₹${finalMoney.toFixed(2)}\n• Litres: ${finalLitres.toFixed(3)} L\n• Price: ₹${finalPricePerLitre.toFixed(2)}/L${odoLine}`;
+        } else if (event_type === 'service') {
+            const amountLine = finalMoney !== null ? `\n• Amount: ₹${finalMoney.toFixed(2)}` : "";
+            msg = `🔧 Bike service expense saved\n• Category: ${finalCategory}${amountLine}\n• Description: ${finalDescription}${odoLine}`;
+        } else {
+            msg = `📝 Bike observation logged\n• Category: ${finalCategory}\n• Description: ${finalDescription}${odoLine}`;
+        }
+
+        if (warnings.length > 0) {
+            msg += `\n\n${warnings.join('\n')}`;
+        }
+
+        await sendTelegramReply(chatId, msg);
+    }
+
+    return {
+        success: true,
+        id: uniqueId,
+        message: `Bike ${event_type} entry recorded successfully.`
+    };
+}
 
 function getMonthSheetName(dateInput = new Date()) {
     const dateObj = new Date(dateInput);
@@ -246,9 +795,39 @@ async function executeQueryExpenses(queryArgs, spreadsheetId) {
     return await queryExpenses(queryArgs.startDate, queryArgs.endDate, queryArgs.category, spreadsheetId);
 }
 
-async function processExpenseMessage(message, spreadsheetId, { chatId, sendTelegramReply } = {}) {
+async function processExpenseMessage(message, spreadsheetId, options = {}) {
+    const { chatId, sendTelegramReply, bikeSpreadsheetId, messageId } = options;
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. Calling logExpense automatically records the transaction to Google Sheets and immediately sends a confirmation message to the user on Telegram. If you are ONLY logging expenses (and the user did not ask a question or request a query), do NOT generate any text response at all. You can call tools multiple times if multiple expenses are mentioned or if a query is also requested. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
+
+    let prompt;
+    let activeDeclarations;
+
+    if (bikeSpreadsheetId) {
+        activeDeclarations = [
+            logExpenseDeclaration,
+            queryExpensesDeclaration,
+            logBikeEventDeclaration
+        ];
+        prompt = `Evaluate the following message: "${message}". Decide what action to take:
+1. If the user mentions an expense, fuel refill, maintenance/servicing, or observation/note for their Triumph Speed 400 motorcycle / bike:
+   - Call the logBikeEvent tool. Calling logBikeEvent automatically records to the bike spreadsheet (and syncs financial expenses to the personal expense sheet) and immediately sends a confirmation to the user on Telegram.
+   - For fuel refills (e.g. "500 petrol odo 1200", "4L XP95", "petrol 800"): set event_type="fuel", fuel_name, money, litres, and odo if stated. IMPORTANT: DO NOT calculate fuel conversions or litres yourself; backend tool code calculates everything deterministically.
+   - For bike maintenance/servicing/repairs/accessories/cleaning/parking (e.g. "chain lube 250", "bike wash 100", "first service 2450 odo 1000"): set event_type="service".
+   - For bike observations/inspection notes/issues without expense (e.g. "rear brake clicking odo 1200", "engine vibration at 4000 rpm"): set event_type="log".
+2. If the user wants to log a general personal expense or income (not motorcycle-related):
+   - Call the logExpense tool. Calling logExpense automatically records the transaction to Google Sheets and immediately sends a confirmation to Telegram. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative.
+3. If it's a query for past spending, call the queryExpenses tool.
+4. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools.
+If you are ONLY logging expenses or bike events (and the user did not ask a question or request a query), do NOT generate any text response at all. You can call tools multiple times if multiple expenses are mentioned. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
+    } else {
+        activeDeclarations = [
+            logExpenseDeclaration,
+            queryExpensesDeclaration
+        ];
+        prompt = `Evaluate the following message: "${message}". Decide if the user wants to log an expense or query past expenses. If it's a logging request, call the logExpense tool. Calling logExpense automatically records the transaction to Google Sheets and immediately sends a confirmation message to the user on Telegram. If you are ONLY logging expenses (and the user did not ask a question or request a query), do NOT generate any text response at all. You can call tools multiple times if multiple expenses are mentioned or if a query is also requested. If the user mentions earning money or provides a negative value, treat it as income and ensure the amount passed to logExpense is negative. If it's a query for past spending, call the queryExpenses tool. If they are just saying hi or chatting or the input is invalid, just respond conversationally to them without calling tools. Assume current context if not specified (today is ${todayIST} Indian Standard Time). Unless explicitly mentioned, set payment_method to "UPI". Deduce "need_want" logically.`;
+    }
+
+    const toolsConfig = [{ functionDeclarations: activeDeclarations }];
 
     const contents = [
         { role: "user", parts: [{ text: prompt }] }
@@ -258,6 +837,7 @@ async function processExpenseMessage(message, spreadsheetId, { chatId, sendTeleg
     let turn = 0;
     let executedToolsCount = 0;
     let logCount = 0;
+    let bikeCount = 0;
     let queryCount = 0;
     let finalModelText = null;
 
@@ -288,7 +868,7 @@ async function processExpenseMessage(message, spreadsheetId, { chatId, sendTeleg
                     model: 'gemini-3.6-flash',
                     contents: contents,
                     config: {
-                        tools: geminiTools
+                        tools: toolsConfig
                     }
                 });
                 success = true;
@@ -350,6 +930,13 @@ async function processExpenseMessage(message, spreadsheetId, { chatId, sendTeleg
             if (call.name === "logExpense" || call.name === "addExpense") {
                 logCount++;
                 toolResult = await executeLogExpense(call.args, spreadsheetId, { chatId, sendTelegramReply });
+            } else if (call.name === "logBikeEvent") {
+                bikeCount++;
+                toolResult = await executeLogBikeEvent(call.args, bikeSpreadsheetId, spreadsheetId, {
+                    chatId,
+                    sendTelegramReply,
+                    messageId: options?.messageId
+                });
             } else if (call.name === "queryExpenses") {
                 queryCount++;
                 toolResult = await executeQueryExpenses(call.args, spreadsheetId);
@@ -376,10 +963,10 @@ async function processExpenseMessage(message, spreadsheetId, { chatId, sendTeleg
         });
     }
 
-    // If only expense logging was performed without any queries or questions,
-    // the logExpense tool already sent the Telegram confirmations directly.
+    // If only expense/bike logging was performed without any queries or questions,
+    // the tools already sent the Telegram confirmations directly.
     // Suppress any redundant trailing summary text.
-    if (logCount > 0 && queryCount === 0) {
+    if ((logCount > 0 || bikeCount > 0) && queryCount === 0) {
         finalModelText = null;
     }
 
@@ -742,6 +1329,39 @@ async function verifySpreadsheetAccess(spreadsheetId) {
     }
 }
 
+// Register virtual bikeService in require.cache so require('./bikeService') resolves seamlessly anywhere
+try {
+    const Module = require('module');
+    const originalResolveFilename = Module._resolveFilename;
+    const bikeModulePath = path.resolve(__dirname, 'bikeService.js');
+
+    Module._resolveFilename = function (request, parent, isMain, options) {
+        if (request === './bikeService' || request === './bikeService.js' || request === 'bikeService') {
+            return bikeModulePath;
+        }
+        return originalResolveFilename.call(this, request, parent, isMain, options);
+    };
+
+    require.cache[bikeModulePath] = {
+        id: bikeModulePath,
+        filename: bikeModulePath,
+        loaded: true,
+        exports: {
+            executeLogBikeEvent,
+            ensureBikeSheetsExist,
+            getFuelPrices,
+            refreshFuelPrices,
+            computeFuelDetails,
+            getLatestOdometer,
+            isDuplicateBikeEntry,
+            logBikeEventDeclaration,
+            formatISTDateTime,
+            formatISTDate,
+            BIKE_CATEGORIES
+        }
+    };
+} catch (_) {}
+
 module.exports = {
     processExpenseMessage,
     getTodayTotal,
@@ -753,5 +1373,19 @@ module.exports = {
     getAllExpenses,
     verifySpreadsheetAccess,
     isRetryableGeminiError,
-    sleep
+    sleep,
+    // Bike service exports
+    executeLogBikeEvent,
+    ensureBikeSheetsExist,
+    getFuelPrices,
+    refreshFuelPrices,
+    computeFuelDetails,
+    getLatestOdometer,
+    isDuplicateBikeEntry,
+    logBikeEventDeclaration,
+    executeLogExpense,
+    getSheetsClient,
+    formatISTDateTime,
+    formatISTDate,
+    BIKE_CATEGORIES
 };

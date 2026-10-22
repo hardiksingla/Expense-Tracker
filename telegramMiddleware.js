@@ -1,4 +1,5 @@
 const { User } = require('./models');
+const mongoose = require('mongoose');
 
 const verifyTelegramWebhook = (req, res, next) => {
     const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
@@ -29,22 +30,28 @@ const telegramAuthMiddleware = async (req, res, next) => {
     }
 
     let spreadsheetId = undefined;
+    let bikeSpreadsheetId = undefined;
 
-    // Try finding the user in DB and incrementing message count
-    try {
-        const user = await User.findOneAndUpdate(
-            { chatId },
-            {
-                $inc: { messageCount: 1 },
-                $setOnInsert: { username, createdAt: new Date() }
-            },
-            { upsert: true, new: true }
-        );
-        if (user && user.spreadsheetId) {
-            spreadsheetId = user.spreadsheetId;
+    // Try finding the user in DB only if connected, otherwise fallback immediately to .env
+    if (mongoose.connection.readyState === 1) {
+        try {
+            const user = await User.findOneAndUpdate(
+                { chatId },
+                {
+                    $inc: { messageCount: 1 },
+                    $setOnInsert: { username, createdAt: new Date() }
+                },
+                { upsert: true, new: true, maxTimeMS: 3000 }
+            );
+            if (user) {
+                if (user.spreadsheetId) spreadsheetId = user.spreadsheetId;
+                if (user.bikeSpreadsheetId) bikeSpreadsheetId = user.bikeSpreadsheetId;
+            }
+        } catch (e) {
+            console.error("DB Error finding user:", e.message);
         }
-    } catch (e) {
-        console.error("DB Error finding user:", e);
+    } else {
+        console.warn("⚠️ MongoDB not connected yet (readyState != 1). Falling back to .env.");
     }
 
     // Fallback to .env for legacy users if not in DB
@@ -55,8 +62,24 @@ const telegramAuthMiddleware = async (req, res, next) => {
             spreadsheetId = process.env[foundKey];
         }
     }
+    if (!spreadsheetId && process.env.SPREADSHEET_ID) {
+        spreadsheetId = process.env.SPREADSHEET_ID;
+    }
+
+    // Resolve bikeSpreadsheetId from .env if not found in DB
+    if (!bikeSpreadsheetId && username) {
+        const targetBikeKey = `${username}_BIKE_SPREADSHEET_ID`.toLowerCase();
+        const foundBikeKey = Object.keys(process.env).find(k => k.toLowerCase() === targetBikeKey);
+        if (foundBikeKey) {
+            bikeSpreadsheetId = process.env[foundBikeKey];
+        }
+    }
+    if (!bikeSpreadsheetId && process.env.BIKE_SPREADSHEET_ID) {
+        bikeSpreadsheetId = process.env.BIKE_SPREADSHEET_ID;
+    }
 
     req.spreadsheetId = spreadsheetId;
+    req.bikeSpreadsheetId = bikeSpreadsheetId;
     req.username = username || 'User';
     req.chatId = chatId;
     next();
