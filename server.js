@@ -160,20 +160,32 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             return res.status(200).send('Telegram webhook processed');
         }
 
-        if (!spreadsheetId) {
+        if (!spreadsheetId && !bikeSpreadsheetId) {
             await sendTelegramReply(chatId, `⚠️ You haven't set up your Google Sheet yet. Type /start for instructions.`);
             return res.status(200).send('Ignored: No spreadsheet setup');
         }
 
         if (text === '/today') {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const total = await getTodayTotal(spreadsheetId);
             await sendTelegramReply(chatId, `Today's Total Expenses: ₹${total.toFixed(2)}`);
         }
         else if (text === '/month') {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const total = await getMonthTotal(spreadsheetId);
             await sendTelegramReply(chatId, `This Month's Total Expenses: ₹${total.toFixed(2)}`);
         }
         else if (text === '/avg') {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const stats = await getAveragePerDayThisMonth(spreadsheetId);
             if (!stats) {
                 await sendTelegramReply(chatId, "⚠️ Could not fetch average. Ensure Google Sheets is configured.");
@@ -184,6 +196,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text.startsWith('/overview')) {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const args = text.split(' ');
             const targetMonth = args.length > 1 ? args.slice(1).join(' ') : null;
             const overviewStr = await getCategoryOverviewThisMonth(spreadsheetId, targetMonth);
@@ -198,6 +214,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/undo') {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const deletedAmount = await undoLastExpense(spreadsheetId);
             if (deletedAmount !== null) {
                 await sendTelegramReply(chatId, `↩️ Undid the last recorded expense of ₹${deletedAmount}.`);
@@ -206,6 +226,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/last') {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const lastExp = await getLastExpense(spreadsheetId);
             if (lastExp) {
                 await sendTelegramReply(chatId, `🕒 Last Expense:\n₹${lastExp.amount} for ${lastExp.category}\nDate: ${lastExp.date}\nDescription: ${lastExp.description}\nAdded At: ${lastExp.addedAt}`);
@@ -214,6 +238,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
         else if (text === '/dashboard') {
+            if (!spreadsheetId) {
+                await sendTelegramReply(chatId, `⚠️ You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.`);
+                return res.status(200).send('Telegram webhook processed');
+            }
             const token = jwt.sign({ spreadsheetId, username }, JWT_SECRET, { expiresIn: '7d' });
             // Try to figure out current host
             const host = req.get('host');

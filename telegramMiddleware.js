@@ -1,4 +1,4 @@
-const { User } = require('./models');
+const { User, connectDB } = require('./models');
 const mongoose = require('mongoose');
 
 const verifyTelegramWebhook = (req, res, next) => {
@@ -23,16 +23,25 @@ const telegramAuthMiddleware = async (req, res, next) => {
     }
 
     const username = msgObj.from?.username;
-    const chatId = msgObj.chat?.id;
+    const rawChatId = msgObj.chat?.id || msgObj.from?.id;
 
-    if (!chatId) {
+    if (!rawChatId) {
         return res.status(200).send('Ignored: No chatId');
     }
+
+    const chatId = Number(rawChatId);
 
     let spreadsheetId = undefined;
     let bikeSpreadsheetId = undefined;
 
-    // Try finding the user in DB only if connected, otherwise fallback immediately to .env
+    // Ensure MongoDB connection is established before querying
+    try {
+        await connectDB();
+    } catch (e) {
+        console.warn("⚠️ connectDB attempt failed in middleware:", e.message);
+    }
+
+    // Try finding the user in DB if connected
     if (mongoose.connection.readyState === 1) {
         try {
             const user = await User.findOneAndUpdate(
@@ -41,11 +50,27 @@ const telegramAuthMiddleware = async (req, res, next) => {
                     $inc: { messageCount: 1 },
                     $setOnInsert: { username, createdAt: new Date() }
                 },
-                { upsert: true, new: true, maxTimeMS: 3000 }
+                { upsert: true, returnDocument: 'after' }
             );
             if (user) {
                 if (user.spreadsheetId) spreadsheetId = user.spreadsheetId;
                 if (user.bikeSpreadsheetId) bikeSpreadsheetId = user.bikeSpreadsheetId;
+            }
+
+            // Fallback: If spreadsheetId or bikeSpreadsheetId missing on chatId doc, check username doc if available
+            if ((!spreadsheetId || !bikeSpreadsheetId) && username) {
+                const legacyDoc = await User.findOne({
+                    username: new RegExp(`^${username}$`, 'i'),
+                    $or: [{ spreadsheetId: { $exists: true, $ne: null } }, { bikeSpreadsheetId: { $exists: true, $ne: null } }]
+                });
+                if (legacyDoc) {
+                    if (!spreadsheetId && legacyDoc.spreadsheetId) {
+                        spreadsheetId = legacyDoc.spreadsheetId;
+                    }
+                    if (!bikeSpreadsheetId && legacyDoc.bikeSpreadsheetId) {
+                        bikeSpreadsheetId = legacyDoc.bikeSpreadsheetId;
+                    }
+                }
             }
         } catch (e) {
             console.error("DB Error finding user:", e.message);

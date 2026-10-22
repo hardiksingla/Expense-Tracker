@@ -6,19 +6,30 @@ try {
     dns.setServers(['8.8.8.8', '8.8.4.4']);
 } catch (_) {}
 
+let dbPromise = null;
+
 const connectDB = async () => {
-    try {
-        if (!process.env.MONGO_URI) {
-            console.warn("⚠️ MONGO_URI is missing from .env. MongoDB connection skipped.");
-            return;
-        }
-        await mongoose.connect(process.env.MONGO_URI, {
-            serverSelectionTimeoutMS: 5000
-        });
-        console.log("✅ MongoDB connected successfully");
-    } catch (err) {
-        console.error("❌ MongoDB connection failed:", err.message);
+    if (mongoose.connection.readyState === 1) {
+        return mongoose.connection;
     }
+    if (dbPromise) {
+        return dbPromise;
+    }
+    if (!process.env.MONGO_URI) {
+        console.warn("⚠️ MONGO_URI is missing from .env. MongoDB connection skipped.");
+        return null;
+    }
+    dbPromise = mongoose.connect(process.env.MONGO_URI, {
+        serverSelectionTimeoutMS: 5000
+    }).then(conn => {
+        console.log("✅ MongoDB connected successfully");
+        return conn;
+    }).catch(err => {
+        console.error("❌ MongoDB connection failed:", err.message);
+        dbPromise = null;
+        return null;
+    });
+    return dbPromise;
 };
 
 const userSchema = new mongoose.Schema({

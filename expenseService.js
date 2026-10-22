@@ -736,6 +736,14 @@ async function ensureMonthlySheetExists(sheetName, spreadsheetId) {
 }
 
 async function executeLogExpense(expenseData, spreadsheetId, { chatId, sendTelegramReply } = {}) {
+    if (!spreadsheetId) {
+        const errMsg = "You haven't linked a personal expense sheet yet. Send your Google Sheet link or /expensesheet <URL> to set it up.";
+        if (chatId && sendTelegramReply) {
+            await sendTelegramReply(chatId, `⚠️ ${errMsg}`);
+        }
+        return { success: false, error: errMsg };
+    }
+
     if (expenseData.is_error) {
         console.log(`⚠️ Blocked invalid expense due to missing info: ${expenseData.error_message}`);
         if (chatId && sendTelegramReply) {
